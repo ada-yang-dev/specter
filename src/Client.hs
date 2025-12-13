@@ -7,7 +7,6 @@ import Control.Concurrent.Async (race_)
 import Control.Exception (SomeException, bracket, catch)
 import Control.Monad (unless)
 import Data.ByteString.Char8 qualified as BS
-import Data.Char (isHexDigit)
 import Network.Socket
 import System.Environment (getExecutablePath)
 import System.FilePath (replaceFileName)
@@ -28,17 +27,14 @@ main = do
   where
     fwd f from to = BS.hGetLine from >>= BS.hPutStrLn to . f >> fwd f from to
 
+-- MCP frameworks double-escape: \r becomes \\r in JSON stream
+-- Remove one layer of escaping so JSON parser sees the original
 unescapeCtrl :: BS.ByteString -> BS.ByteString
 unescapeCtrl = BS.pack . go . BS.unpack
   where
-    go s = case span (== '\\') s of
-      ([], []) -> []
-      ([], c : r) -> c : go r
-      (bs, 'u' : '0' : '0' : a : b : r)
-        | isHexDigit a,
-          isHexDigit b ->
-            replicate ((length bs + 1) `div` 2) '\\' ++ ('u' : '0' : '0' : a : b : go r)
-      (bs, r) -> bs ++ go r
+    go ('\\' : '\\' : r) = '\\' : go r
+    go (c : r) = c : go r
+    go [] = []
 
 ensureDaemon :: IO ()
 ensureDaemon = tryConnect >>= (`unless` startDaemon)
