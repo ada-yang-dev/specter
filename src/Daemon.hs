@@ -1104,7 +1104,5 @@ main = do
       <*> newTVarIO 0
       <*> newTVarIO 0
   sock <- socket AF_UNIX Stream 0
-  bind sock (SockAddrUnix sockPath)
-  listen sock 5
-  putStrLn $ "Listening on " <> sockPath
+  bind sock (SockAddrUnix sockPath) >> listen sock 5
   forever $ accept sock >>= forkIO . handleClient env . fst

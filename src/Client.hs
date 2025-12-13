@@ -5,7 +5,7 @@ module Main where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race_)
 import Control.Exception (SomeException, bracket, catch)
-import Control.Monad (unless)
+import Control.Monad (forever, unless)
 import Data.ByteString.Char8 qualified as BS
 import Network.Socket
 import System.Environment (getExecutablePath)
@@ -25,7 +25,7 @@ main = do
     hSetBuffering h LineBuffering
     race_ (fwd unescapeCtrl stdin h) (fwd id h stdout)
   where
-    fwd f from to = BS.hGetLine from >>= BS.hPutStrLn to . f >> fwd f from to
+    fwd f from to = forever $ BS.hGetLine from >>= BS.hPutStrLn to . f
 
 -- MCP frameworks double-escape: \r becomes \\r in JSON stream
 -- Remove one layer of escaping so JSON parser sees the original

@@ -16,13 +16,13 @@
           (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; });
       });
 
-      devShells = forAll (pkgs: {
+      devShells = forAll (pkgs: let sys = pkgs.stdenv.hostPlatform.system; in {
         default = pkgs.haskellPackages.shellFor {
-          packages = _: [ self.packages.${pkgs.system}.default ];
+          packages = _: [ self.packages.${sys}.default ];
           buildInputs = [ pkgs.cabal-install pkgs.opencode ];
           shellHook = ''
             [ -f specter.cabal ] && cat > opencode.json <<EOF
-            {"mcp":{"specter":{"type":"local","command":["${self.packages.${pkgs.system}.default}/bin/specter"]}}}
+            {"mcp":{"specter":{"type":"local","command":["${self.packages.${sys}.default}/bin/specter"]}}}
             EOF
           '';
         };
