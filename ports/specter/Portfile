@@ -1,0 +1,31 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem          1.0
+PortGroup           github 1.0
+
+github.setup        ada-yang-dev specter 1.0.0 v
+revision            0
+categories          sysutils
+license             CC-BY-NC-SA-4.0
+maintainers         {ada-yang.dev:git @ada-yang-dev} openmaintainer
+description         Authentic terminal primitives enabling autonomous agents to operate interactive applications.
+long_description    Specter is a terminal emulator daemon providing PTY multiplexing \
+                    with stateful workspace ownership and escape sequence passthrough. \
+                    It enables LLM agents to operate interactive terminal applications \
+                    including TUI programs and other autonomous agents.
+
+depends_build       port:ghc \
+                    port:cabal-install
+
+use_configure       no
+
+build {
+    system -W ${worksrcpath} "cabal update"
+    system -W ${worksrcpath} "cabal build all"
+}
+
+destroot {
+    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specter/build/specter/specter] ${destroot}${prefix}/bin/
+    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specterd/build/specterd/specterd] ${destroot}${prefix}/bin/
+    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specterctl/build/specterctl/specterctl] ${destroot}${prefix}/bin/
+}

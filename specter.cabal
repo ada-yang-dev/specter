@@ -1,0 +1,56 @@
+cabal-version: 2.4
+name:          specter
+version:       1.0.0
+synopsis:      Authentic terminal primitives enabling autonomous agents to operate interactive applications.
+license:       CC-BY-NC-SA-4.0
+license-file:  LICENSE
+build-type:    Simple
+
+executable specter
+  main-is:          Client.hs
+  hs-source-dirs:   src
+  default-language: GHC2024
+  ghc-options:      -threaded -O2 -Wall -Wextra -Werror -Wno-missing-signatures
+  build-depends:
+    , aeson
+    , async
+    , base
+    , bytestring
+    , filepath
+    , network
+    , process
+    , text
+
+executable specterd
+  main-is:          Daemon.hs
+  hs-source-dirs:   src
+  default-language: GHC2024
+  ghc-options:      -threaded -O2 -Wall -Wextra -Werror -Wno-missing-signatures
+  build-depends:
+    , aeson
+    , async
+    , attoparsec
+    , base
+    , bytestring
+    , containers
+    , directory
+    , lens
+    , network
+    , posix-pty
+    , process
+    , stm
+    , text
+    , unix
+    , vector
+
+executable specterctl
+  main-is:          Ctl.hs
+  hs-source-dirs:   src
+  default-language: GHC2024
+  ghc-options:      -threaded -O2 -Wall -Wextra -Werror -Wno-missing-signatures
+  build-depends:
+    , aeson
+    , base
+    , bytestring
+    , network
+    , text
