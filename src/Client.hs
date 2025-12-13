@@ -28,13 +28,17 @@ main = do
     fwd f from to = forever $ BS.hGetLine from >>= BS.hPutStrLn to . f
 
 -- MCP frameworks double-escape: \r becomes \\r in JSON stream
--- Remove one layer of escaping so JSON parser sees the original
+-- Convert known escapes to unicode so daemon's JSON parser sees control chars
+-- Unknown escapes pass through unchanged (safe for JSON)
 unescapeCtrl :: BS.ByteString -> BS.ByteString
 unescapeCtrl = BS.pack . go . BS.unpack
   where
-    go ('\\' : '\\' : r) = '\\' : go r
-    go (c : r) = c : go r
     go [] = []
+    go ('\\' : '\\' : '\\' : '\\' : r) = '\\' : '\\' : go r
+    go ('\\' : '\\' : 'r' : r) = '\\' : 'u' : '0' : '0' : '0' : 'd' : go r
+    go ('\\' : '\\' : 'n' : r) = '\\' : 'u' : '0' : '0' : '0' : 'a' : go r
+    go ('\\' : '\\' : 't' : r) = '\\' : 'u' : '0' : '0' : '0' : '9' : go r
+    go (c : r) = c : go r
 
 ensureDaemon :: IO ()
 ensureDaemon = tryConnect >>= (`unless` startDaemon)
