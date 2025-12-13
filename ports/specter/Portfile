@@ -14,18 +14,17 @@ long_description    Specter is a terminal emulator daemon providing PTY multiple
                     It enables LLM agents to operate interactive terminal applications \
                     including TUI programs and other autonomous agents.
 
-depends_build       port:ghc \
-                    port:cabal-install
+depends_build       port:nix
 
 use_configure       no
 
 build {
-    system -W ${worksrcpath} "cabal update"
-    system -W ${worksrcpath} "cabal build all"
+    system -W ${worksrcpath} "nix build --no-link"
 }
 
 destroot {
-    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specter/build/specter/specter] ${destroot}${prefix}/bin/
-    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specterd/build/specterd/specterd] ${destroot}${prefix}/bin/
-    xinstall -m 755 [glob ${worksrcpath}/dist-newstyle/build/*/ghc-*/specter-*/x/specterctl/build/specterctl/specterctl] ${destroot}${prefix}/bin/
+    set nixout [exec nix build ${worksrcpath} --no-link --print-out-paths]
+    xinstall -m 755 ${nixout}/bin/specter ${destroot}${prefix}/bin/
+    xinstall -m 755 ${nixout}/bin/specterd ${destroot}${prefix}/bin/
+    xinstall -m 755 ${nixout}/bin/specterctl ${destroot}${prefix}/bin/
 }

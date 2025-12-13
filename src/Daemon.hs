@@ -1,14 +1,8 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TypeApplications #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module Main where
 
