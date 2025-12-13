@@ -63,7 +63,7 @@ type Cell = (Char, Attrs)
 
 blankAttrs = Attrs 7 0 0 0 False False False
 
-data TermLine = TermLine {_lineCells :: !(V.Vector Cell), _lineWrapped :: !Bool}
+data TermLine = TermLine {_lineCells :: !(V.Vector Cell), _lineHasNewline :: !Bool}
   deriving (Show, Eq, Ord)
 
 makeLenses ''TermLine
@@ -204,7 +204,8 @@ renderViewport term = T.concat [renderLine r | r <- [0 .. lastRow]] <> "\ESC[0m"
             | vline < scrollLen -> scrollSeq `Seq.index` vline
             | otherwise -> screen ^. tlIndex (vline - scrollLen)
     getCell r = safeIndex (getTermLine r ^. lineCells)
-    isWrapped r = getTermLine r ^. lineWrapped
+    hasNewline r = getTermLine r ^. lineHasNewline
+    isFull r = lastCol r == cols - 1
     safeIndex line i = fromMaybe (' ', blankAttrs) $ line V.!? i
 
     lastCol r = max cursorEnd contentEnd
@@ -220,13 +221,15 @@ renderViewport term = T.concat [renderLine r | r <- [0 .. lastRow]] <> "\ESC[0m"
       | showCursor, r == cursorR, c == cursorC = (ch, attrs & attrsInverse %~ not)
       | otherwise = (ch, attrs)
 
-    -- Soft-wrap marker: ESC[?7w (7 = DECAWM reference, w = wrap)
+    -- Soft-wrap: line full without logical newline
     softWrapMarker = "\ESC[?7w"
 
-    renderLine r =
-      let cells = [withCursor r c (getCell r c) | c <- [0 .. lastCol r]]
-          wrapMark = if isWrapped r then softWrapMarker else ""
-       in renderCells blankAttrs cells <> wrapMark <> "\n"
+    renderLine r
+      | term ^. altScreenActive = renderCells blankAttrs [getCell r c | c <- [0 .. cols - 1]] <> "\n"
+      | otherwise =
+          let cells = [withCursor r c (getCell r c) | c <- [0 .. lastCol r]]
+              lineEnd = if hasNewline r || not (isFull r) then "\n" else softWrapMarker
+           in renderCells blankAttrs cells <> lineEnd
 
     renderCells _ [] = ""
     renderCells prev ((ch, attrs) : rest) = attrsSGR prev attrs <> T.singleton ch <> renderCells attrs rest
@@ -596,7 +599,7 @@ cursorMoveTo (row, col) t = t & cursorRow .~ limit minY maxY row & cursorCol .~ 
   where
     (minY, maxY) = if t ^. cursorState . origin then (t ^. scrollTop, t ^. scrollBottom) else (0, t ^. numRows - 1)
 
-processLF = addNewline True
+processLF = (cursorLine . lineHasNewline .~ True) >>> addNewline True
 
 reverseIndex t
   | t ^. cursorRow == t ^. scrollTop = termScrollDown (t ^. scrollTop) 1 t
@@ -659,9 +662,8 @@ termScrollUp orig n t = (copyToScrollBack >>> activeScreen %~ update) t
 processVisibleChar c = moveBefore >>> shiftChars >>> setChar >>> moveAfter
   where
     moveBefore t
-      | t ^. modeWrap && t ^. cursorState . wrapNext = markWrapped >>> addNewline True $ t
+      | t ^. modeWrap && t ^. cursorState . wrapNext = addNewline True t
       | otherwise = t
-    markWrapped = cursorLine . lineWrapped .~ True
     shiftChars t
       | t ^. insertMode && t ^. cursorCol < t ^. numCols - 1 =
           let col = t ^. cursorCol
