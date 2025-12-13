@@ -1,12 +1,11 @@
 # -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
 
 PortSystem          1.0
-PortGroup           github 1.0
 
-github.setup        ada-yang-dev specter 0.1.0 v
-
+name                specter
+version             0.0.1
 categories          sysutils
-platforms           {darwin >= 21}
+platforms           darwin
 supported_archs     arm64
 license             CC-BY-NC-SA-4.0
 maintainers         {ada-yang.dev:git @ada-yang-dev} openmaintainer
@@ -23,21 +22,28 @@ long_description    Specter provides authentic terminal primitives for autonomou
 
 homepage            https://github.com/ada-yang-dev/specter
 
-checksums           rmd160  0 \
-                    sha256  0 \
-                    size    0
+fetch.type          none
 
-depends_build       port:nix
+depends_run         port:nix
 
 use_configure       no
+build               {}
 
-build               { system -W ${worksrcpath} "nix build --no-link" }
+set profile         /nix/var/nix/profiles/macports
 
 destroot {
-    set out [exec nix build ${worksrcpath}#default --no-link --print-out-paths]
-    xinstall -m 755 ${out}/bin/specter ${destroot}${prefix}/bin/
-    xinstall -m 755 ${out}/bin/specterd ${destroot}${prefix}/bin/
-    xinstall -m 755 ${out}/bin/specterctl ${destroot}${prefix}/bin/
+    xinstall -d ${destroot}${prefix}/bin
+    ln -s ${profile}/bin/specter ${destroot}${prefix}/bin/specter
+    ln -s ${profile}/bin/specterd ${destroot}${prefix}/bin/specterd
+    ln -s ${profile}/bin/specterctl ${destroot}${prefix}/bin/specterctl
+}
+
+post-activate {
+    system "nix profile install github:ada-yang-dev/specter --profile ${profile} --refresh"
+}
+
+pre-deactivate {
+    system "nix profile remove '.*specter.*' --profile ${profile} ||:"
 }
 
 notes "specterd: /tmp/specter.sock"

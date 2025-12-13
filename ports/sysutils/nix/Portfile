@@ -3,21 +3,22 @@
 PortSystem          1.0
 
 name                nix
-version             2.33.0
+version             2.94.0
 categories          sysutils
-platforms           {darwin >= 21}
+platforms           darwin
 supported_archs     arm64
 license             LGPL-2.1
 maintainers         {ada-yang.dev:git @ada-yang-dev} openmaintainer
-description         Purely functional package manager
-long_description    Self-healing Nix installation via official installer delegation.
+description         Nix package manager (Lix implementation)
+long_description    Self-healing Nix installation via Lix installer delegation.
 
-homepage            https://nixos.org
-master_sites        https://releases.nixos.org/nix/nix-${version}/
-distname            nix-${version}-aarch64-darwin
-checksums           sha256 cb24dfa5d8b2ff87492cd34082e51139f1f35970f04a8da3fb90e2e4894346ed
-extract.suffix      .tar.xz
+homepage            https://lix.systems
+master_sites        https://install.lix.systems/
+distname            lix
+extract.suffix
+checksums           sha256 2048ddb5af8e4cbcdee185a094e1433211eea257246223176c3594cfb1abd90f
 
+extract             {}
 use_configure       no
 build               {}
 
@@ -25,8 +26,8 @@ set share           ${prefix}/share/nix
 set bin             ${prefix}/bin
 
 destroot {
-    xinstall -d ${destroot}${share}/installer ${destroot}${bin}
-    system "cp -R ${workpath}/${distname}/* ${destroot}${share}/installer/"
+    xinstall -d ${destroot}${share} ${destroot}${bin}
+    xinstall -m 755 ${distpath}/${distname} ${destroot}${share}/install.sh
     
     # Only `nix` is wrapped; block unwrapped entry points
     foreach cmd {nix-build nix-shell nix-env nix-store nix-instantiate nix-collect-garbage nix-channel} {
@@ -36,25 +37,23 @@ destroot {
         file attributes ${destroot}${bin}/${cmd} -permissions +x
     }
     
-    # Wrapper: revive → gc → delegate
+    # Wrapper: gc → delegate (Lix survives macOS upgrades; if broken, reinstall via MacPorts)
     set f [open ${destroot}${bin}/nix w]
-    puts ${f} {#!/bin/sh
-[ -x /nix/var/nix/profiles/default/bin/nix ] || { echo "Reviving..." >&2; cd /opt/local/share/nix/installer && sudo ./install --daemon --yes; }
-m=/opt/local/share/nix/.gc; [ -f "$m" ] && [ $(($(date +%s) - $(stat -f %m "$m"))) -lt 86400 ] || { /nix/var/nix/profiles/default/bin/nix-collect-garbage --delete-older-than 1d >/dev/null 2>&1 ||:; touch "$m"; }
-export NIX_CONFIG="experimental-features = nix-command flakes"
+    set script {#!/bin/sh
+m=@SHARE@/.gc; [ -f "$m" ] && [ $(($(date +%s) - $(stat -f %m "$m"))) -lt 86400 ] || { /nix/var/nix/profiles/default/bin/nix-collect-garbage --delete-older-than 1d >/dev/null 2>&1 ||:; touch "$m"; }
 exec /nix/var/nix/profiles/default/bin/nix "$@"}
+    puts ${f} [string map [list @SHARE@ ${share}] $script]
     close ${f}
     file attributes ${destroot}${bin}/nix -permissions +x
 }
 
 post-activate {
-    system "cd ${share}/installer && ./install --daemon --yes ||:"
+    ui_msg "Running Nix installer..."
+    system "sh ${share}/install.sh -- install --no-confirm ||:"
 }
 
 pre-deactivate {
-    # Revive to uninstall: need working tools for clean cleanup
-    system "[ -x /nix/nix-installer ] || { cd ${share}/installer && ./install --daemon --yes ||:; }"
-    system "/nix/nix-installer uninstall --no-confirm ||:"
+    system "/nix/lix-installer uninstall --no-confirm ||:"
 }
 
-notes "Self-healing. Daily GC. Use nix command."
+notes "Self-healing. Daily GC. Flakes enabled by default."
