@@ -322,6 +322,7 @@ data CSI
   | CSIDECRST !DECPrivateMode
   | CSISGR ![SGR]
   | CSIDeviceStatusReport !Int
+  | CSIDA1
   | CSISetMode !Int
   | CSIResetMode !Int
   deriving (Show, Eq)
@@ -441,6 +442,7 @@ parseStdCsi 'r' args = Just $ CSIDECSTBM (zeroToNothing (NE.head args)) (zeroToN
 parseStdCsi 'h' args = Just $ CSISetMode (NE.head args)
 parseStdCsi 'l' args = Just $ CSIResetMode (NE.head args)
 parseStdCsi 'n' args = Just $ CSIDeviceStatusReport (NE.head args)
+parseStdCsi 'c' _ = Just CSIDA1
 parseStdCsi 'm' args = Just $ CSISGR (parseSGRCodes (NE.toList args))
 parseStdCsi _ _ = Nothing
 
@@ -548,6 +550,7 @@ processCSI = \case
   CSIDECRST m -> termProcessDec False m
   CSISGR sgrs -> termAttrs %~ appEndo (foldMap (Endo . applySGR) sgrs)
   CSIDeviceStatusReport _ -> id
+  CSIDA1 -> id
   CSISetMode 4 -> insertMode .~ True
   CSISetMode _ -> id
   CSIResetMode 4 -> insertMode .~ False
@@ -831,12 +834,17 @@ spawnTerminal' Env {..} wsId mCmd (width, height) = do
       forever $
         ( tryReadPty pty >>= \case
             Left _ -> threadDelay 10000
-            Right bs -> atomically $ do
-              leftover <- readTVar termParseState
-              let input = leftover <> TE.decodeUtf8Lenient bs
-                  (atoms, remaining) = parseAtoms input
-              writeTVar termParseState remaining
-              modifyTVar' termTerm (resetViewport . flip processTermAtoms atoms)
+            Right bs -> do
+              atoms <- atomically $ do
+                leftover <- readTVar termParseState
+                let input = leftover <> TE.decodeUtf8Lenient bs
+                    (atoms, remaining) = parseAtoms input
+                writeTVar termParseState remaining
+                modifyTVar' termTerm (resetViewport . flip processTermAtoms atoms)
+                pure atoms
+              forM_ atoms $ \case
+                TermAtomEscapeSequence (EscCSI CSIDA1) -> void $ writePty termPty "\ESC[?1;2c"
+                _ -> pure ()
         )
           `catch` \(_ :: SomeException) -> threadDelay 100000
 
