@@ -1,60 +1,31 @@
 {
   description = "Authentic terminal primitives enabling autonomous agents to operate interactive applications.";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-  };
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAll = f: nixpkgs.lib.genAttrs systems (s: f (import nixpkgs {
+        system = s;
+        config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "specter";
+      }));
+    in {
+      packages = forAll (pkgs: {
+        default = pkgs.haskell.lib.overrideCabal
+          (pkgs.haskellPackages.callCabal2nix "specter" ./. {})
+          (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; });
+      });
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          config.allowUnfreePredicate = pkg: builtins.elem (nixpkgs.lib.getName pkg) [ "specter" "claude-code" ];
+      devShells = forAll (pkgs: {
+        default = pkgs.haskellPackages.shellFor {
+          packages = _: [ self.packages.${pkgs.system}.default ];
+          buildInputs = [ pkgs.cabal-install pkgs.opencode ];
+          shellHook = ''
+            [ -f specter.cabal ] && cat > opencode.json <<EOF
+            {"mcp":{"specter":{"type":"local","command":["${self.packages.${pkgs.system}.default}/bin/specter"]}}}
+            EOF
+          '';
         };
-        haskellPackages = pkgs.haskellPackages;
-
-        specter = pkgs.haskell.lib.overrideCabal (haskellPackages.callCabal2nix "specter" ./. {}) (_: {
-          license = pkgs.lib.licenses.cc-by-nc-sa-40;
-        });
-      in {
-        packages = {
-          default = specter;
-          specter = specter;
-        };
-
-        devShells = {
-          default = haskellPackages.shellFor {
-            packages = p: [ specter ];
-            buildInputs = with haskellPackages; [
-              cabal-install
-              ghcid
-              haskell-language-server
-              hlint
-              ormolu
-            ];
-          };
-
-          demo = pkgs.mkShell {
-            buildInputs = [ specter pkgs.claude-code ];
-            shellHook = ''
-              claude mcp add --scope project --transport stdio specter -- ${specter}/bin/specter 2>/dev/null || true
-              echo "Specter MCP configured. Run 'claude' to start."
-            '';
-          };
-        };
-
-        apps = {
-          default = {
-            type = "app";
-            program = "${specter}/bin/specter";
-          };
-          daemon = {
-            type = "app";
-            program = "${specter}/bin/specterd";
-          };
-        };
-      }
-    );
+      });
+    };
 }
