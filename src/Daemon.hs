@@ -765,12 +765,12 @@ respond rid result = encode $ object ["jsonrpc" .= ("2.0" :: Text), "id" .= rid,
 tools =
   toJSON
     [ tool "attach" "Attach to workspace by ID or create new → {id, created}" [("id", "integer", False)],
-      tool "spawn_terminal" "Spawn shell (default 160×40), becomes current → id" [("cmd", "string", False), ("width", "integer", False), ("height", "integer", False)],
+      tool "spawn_terminal" "Spawn terminal with command (default: $SHELL, 160x40). Returns terminal id." [("cmd", "string", False), ("width", "integer", False), ("height", "integer", False)],
       tool "focus_terminal" "Switch current terminal" [("terminal", "integer", True)],
       tool "list_terminals" "List terminal IDs in workspace" [],
-      tool "read" "Read terminal viewport with ANSI colors" [("terminal", "integer", False)],
-      tool "write" "Send input to terminal" [("terminal", "integer", False), ("input", "string", True)],
-      tool "signal" "Send signal: int, term, kill" [("terminal", "integer", False), ("signal", "string", True)],
+      tool "read" "Read terminal viewport exactly as displayed, with ANSI color codes preserved. Use Shift+PageUp/Down sequences to scroll." [("terminal", "integer", False)],
+      tool "write" "Send input to terminal. Use \\r for Enter, \\u0003 for Ctrl+C, \\u001b for Escape. Double backslashes are halved: \\\\u001b becomes ESC byte." [("terminal", "integer", False), ("input", "string", True)],
+      tool "signal" "Send signal: int (SIGINT), term (SIGTERM), kill (SIGKILL)" [("terminal", "integer", False), ("signal", "string", True)],
       tool "resize" "Resize PTY + SIGWINCH" [("terminal", "integer", False), ("width", "integer", True), ("height", "integer", True)],
       tool "float_terminal" "Move terminal to floating pool → id" [("terminal", "integer", True)],
       tool "grab_floating" "Move floating terminal into workspace → id" [("id", "integer", True)]
