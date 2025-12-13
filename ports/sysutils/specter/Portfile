@@ -1,0 +1,43 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem          1.0
+PortGroup           github 1.0
+
+github.setup        ada-yang-dev specter 0.1.0 v
+
+categories          sysutils
+platforms           {darwin >= 21}
+supported_archs     arm64
+license             CC-BY-NC-SA-4.0
+maintainers         {ada-yang.dev:git @ada-yang-dev} openmaintainer
+
+description         Authentic terminal primitives enabling autonomous agents \
+                    to operate interactive applications.
+
+long_description    Specter provides authentic terminal primitives for autonomous \
+                    agents. The daemon multiplexes PTYs with stateful workspace \
+                    ownership and full escape sequence passthrough. Agents read \
+                    ANSI viewports and write control sequences directly, enabling \
+                    operation of interactive applications including TUI programs, \
+                    shells, and other agents.
+
+homepage            https://github.com/ada-yang-dev/specter
+
+checksums           rmd160  0 \
+                    sha256  0 \
+                    size    0
+
+depends_build       port:nix
+
+use_configure       no
+
+build               { system -W ${worksrcpath} "nix build --no-link" }
+
+destroot {
+    set out [exec nix build ${worksrcpath}#default --no-link --print-out-paths]
+    xinstall -m 755 ${out}/bin/specter ${destroot}${prefix}/bin/
+    xinstall -m 755 ${out}/bin/specterd ${destroot}${prefix}/bin/
+    xinstall -m 755 ${out}/bin/specterctl ${destroot}${prefix}/bin/
+}
+
+notes "specterd: /tmp/specter.sock"
