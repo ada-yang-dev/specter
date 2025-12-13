@@ -1,6 +1,6 @@
 cabal-version: 2.4
 name:          specter
-version:       1.0.0
+version:       0.1.0
 synopsis:      Authentic terminal primitives enabling autonomous agents to operate interactive applications.
 license:       CC-BY-NC-SA-4.0
 license-file:  LICENSE

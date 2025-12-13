@@ -3,7 +3,7 @@
 PortSystem          1.0
 PortGroup           github 1.0
 
-github.setup        ada-yang-dev specter 1.0.0 v
+github.setup        ada-yang-dev specter 0.1.0 v
 revision            0
 categories          sysutils
 license             CC-BY-NC-SA-4.0
