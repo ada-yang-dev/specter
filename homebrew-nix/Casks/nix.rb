@@ -14,7 +14,7 @@ cask "nix" do
       raise "/nix exists. Remove manually before install."
     end
 
-    system_command "sh", args: [staged_path/"lix", "install", "--no-confirm"]
+    system_command "sh", args: [staged_path/"lix", "install", "--no-confirm"], sudo: true
     gc_marker = "#{HOMEBREW_PREFIX}/var/nix/.gc"
     
     FileUtils.mkdir_p "#{HOMEBREW_PREFIX}/var/nix"
@@ -35,7 +35,7 @@ cask "nix" do
   end
 
   uninstall_preflight do
-    system_command "/nix/lix-installer", args: ["uninstall", "--no-confirm"]
+    system_command "/nix/lix-installer", args: ["uninstall", "--no-confirm"], sudo: true
     
     %w[nix nix-build nix-shell nix-env nix-store nix-instantiate nix-collect-garbage nix-channel].each do |cmd|
       FileUtils.rm_f "#{HOMEBREW_PREFIX}/bin/#{cmd}"
