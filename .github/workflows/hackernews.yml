@@ -2,6 +2,8 @@ name: hackernews
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
 
 jobs:
   browse:
@@ -21,11 +23,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          nix develop --command opencode run -m anthropic/claude-sonnet-4-5 '
+          nix develop --command opencode run -m anthropic/claude-opus-4-5 '
             Use specter to browse Y Combinator News active discussions (nix run nixpkgs#lynx -- https://news.ycombinator.com/active).
-            Pick the most interesting story and write ./hn-pick.md with the title, link, and why it caught your attention.
+            Pick the most interesting story and summarize the title, link, and why it caught your attention.
           '
-
-      - name: Today's pick
-        if: always()
-        run: cat hn-pick.md 2>/dev/null || echo "No pick generated"

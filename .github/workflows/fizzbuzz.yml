@@ -21,9 +21,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          nix develop --command opencode run -m anthropic/claude-sonnet-4-5 '
+          nix develop --command opencode run -m anthropic/claude-opus-4-5 '
             Use specter to spawn a terminal.
-            Start an interactive opencode session (run: nix develop --command opencode -m anthropic/claude-sonnet-4-5).
+            Start an interactive opencode session (run: nix develop --command opencode -m anthropic/claude-opus-4-5).
             Through the terminal, ask it to write FizzBuzz 1-100 in bash and save output to ./fizzbuzz.txt.
             Watch the terminal, interact as needed, until the task completes.
           '

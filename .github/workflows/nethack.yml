@@ -23,11 +23,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          nix develop --command opencode run -m anthropic/claude-sonnet-4-5 '
+          nix develop --command opencode run -m anthropic/claude-opus-4-5 '
             Use specter to spawn a terminal and play NetHack autonomously (nix run nixpkgs#nethack).
-            When your journey ends, write ./nethack-report.txt reflecting on what you encountered, decisions you made, and how it concluded.
+            When your journey ends, reflect on what you encountered, decisions you made, and how it concluded.
           '
-
-      - name: Expedition report
-        if: always()
-        run: cat nethack-report.txt 2>/dev/null || echo "No report generated"

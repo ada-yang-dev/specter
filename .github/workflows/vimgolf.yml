@@ -2,6 +2,8 @@ name: vimgolf
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
 
 jobs:
   golf:
@@ -28,7 +30,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          script -q vimgolf.log nix develop --command opencode run -m anthropic/claude-sonnet-4-5 "
+          script -q vimgolf.log nix develop --command opencode run -m anthropic/claude-opus-4-5 "
             Use specter to play vimgolf challenge ${{ env.challenge }}.
             Run: vimgolf put ${{ env.challenge }}
             Edit in vim to match the target, :wq when done. Press q to quit when prompted.
