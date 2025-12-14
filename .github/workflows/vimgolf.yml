@@ -1,9 +1,6 @@
 name: vimgolf
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [dev]
+on: workflow_dispatch
 
 jobs:
   golf:

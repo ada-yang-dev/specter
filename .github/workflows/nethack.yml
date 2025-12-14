@@ -1,9 +1,6 @@
 name: nethack
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [dev]
+on: workflow_dispatch
 
 jobs:
   explore:
@@ -19,7 +16,7 @@ jobs:
           nix build nixpkgs#nethack --no-link
 
       - name: Explore the dungeon
-        timeout-minutes: 15
+        timeout-minutes: 360
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
