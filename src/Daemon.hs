@@ -9,7 +9,7 @@ module Main where
 import Control.Applicative ((<|>))
 import Control.Category ((>>>))
 import Control.Concurrent (forkIO, newMVar, threadDelay, withMVar)
-import Control.Concurrent.Async (async)
+import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, assert, catch)
 import Control.Exception qualified as E
@@ -802,13 +802,14 @@ param :: (FromJSON a) => Text -> Value -> Maybe a
 param k (Object o) = parseMaybe (.: Data.Aeson.Key.fromText k) o
 param _ _ = Nothing
 
-spawnTerminal' Env {..} wsId mCmd (width, height) = do
-  cmd <- maybe (fromMaybe "/bin/sh" <$> lookupEnv "SHELL") pure mCmd
+spawnTerminal' Env {..} Workspace {..} mCmd (width, height) = do
+  shell <- fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
+  let (cmd, args) = maybe (shell, []) (\c -> (shell, ["-c", c])) mCmd
   baseEnv <- getEnvironment
   let penv =
         [("COLUMNS", show width), ("LINES", show height), ("TERM", "xterm-256color")]
           ++ filter (\(k, _) -> k `notElem` ["COLUMNS", "LINES", "TERM"]) baseEnv
-  (pty, ph) <- spawnWithPty (Just penv) True cmd [] (width, height)
+  (pty, ph) <- spawnWithPty (Just penv) True cmd args (width, height)
   termVar <- newTVarIO $ mkTerm (width, height)
   parseVar <- newTVarIO T.empty
   let term = Terminal pty ph termVar parseVar
@@ -817,10 +818,8 @@ spawnTerminal' Env {..} wsId mCmd (width, height) = do
     tid <- readTVar envNextTermId
     modifyTVar' envNextTermId (+ 1)
     modifyTVar' envTerminals (M.insert tid term)
-    mWs <- M.lookup wsId <$> readTVar envActive
-    forM_ mWs \Workspace {..} -> do
-      modifyTVar' wsOwned (S.insert tid)
-      writeTVar wsCurrent (Just tid)
+    modifyTVar' wsOwned (S.insert tid)
+    writeTVar wsCurrent (Just tid)
     pure tid
   void $ async $ do
     _ <- waitForProcess ph
@@ -954,8 +953,8 @@ resizeTerminal env att mTerm w h = withTerminal env att mTerm \Terminal {..} -> 
 (defaultWidth, defaultHeight) = (160, 40)
 
 spawnTerminal env att mCmd mWidth mHeight =
-  withWorkspace env att \wsId _ -> tryIO $ do
-    (tid, _) <- spawnTerminal' env wsId mCmd (fromMaybe defaultWidth mWidth, fromMaybe defaultHeight mHeight)
+  withWorkspace env att \_ ws -> tryIO $ do
+    (tid, _) <- spawnTerminal' env ws mCmd (fromMaybe defaultWidth mWidth, fromMaybe defaultHeight mHeight)
     pure $ ok $ showT tid
 
 focusTerminal env att i = withWorkspace env att \_ Workspace {..} -> do
@@ -1063,6 +1062,7 @@ handleClient env conn = E.bracket (socketToHandle conn ReadWriteMode) hClose \h 
   hSetBuffering h LineBuffering
   lock <- newMVar ()
   attached <- newTVarIO Nothing
+  handlers <- newTVarIO []
   let loop = do
         line <- BL.fromStrict <$> BC8.hGetLine h
         case eitherDecode line of
@@ -1070,11 +1070,14 @@ handleClient env conn = E.bracket (socketToHandle conn ReadWriteMode) hClose \h 
             BL.hPutStrLn h $ encode $ object ["jsonrpc" .= ("2.0" :: Text), "error" .= object ["code" .= (-32700 :: Int), "message" .= e]]
           Right (Request Nothing method params) ->
             void $ handle env attached method params
-          Right (Request (Just rid) method params) -> void $ forkIO $ do
-            result <- handle env attached method params
-            withMVar lock \_ -> BL.hPutStrLn h (respond (Just rid) result)
+          Right (Request (Just rid) method params) -> do
+            a <- async $ do
+              result <- handle env attached method params
+              withMVar lock \_ -> BL.hPutStrLn h (respond (Just rid) result)
+            atomically $ modifyTVar' handlers (a :)
         loop
   loop `catch` \(_ :: SomeException) -> pure ()
+  readTVarIO handlers >>= mapM_ wait
   orphanWorkspaces env attached
 
 orphanWorkspaces env@Env {..} attached =
