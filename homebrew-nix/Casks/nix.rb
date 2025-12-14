@@ -14,7 +14,7 @@ cask "nix" do
       raise "/nix exists. Remove manually before install."
     end
 
-    system_command "sh", args: [staged_path/"lix", "--", "install", "--no-confirm"]
+    system_command "sh", args: [staged_path/"lix", "install", "--no-confirm"]
     gc_marker = "#{HOMEBREW_PREFIX}/var/nix/.gc"
     
     FileUtils.mkdir_p "#{HOMEBREW_PREFIX}/var/nix"
