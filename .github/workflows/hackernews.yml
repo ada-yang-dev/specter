@@ -1,0 +1,31 @@
+name: hackernews
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v24
+
+      - name: Build
+        run: |
+          nix develop --command true
+          nix build nixpkgs#lynx --no-link
+
+      - name: Browse Y Combinator News
+        timeout-minutes: 10
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          nix develop --command opencode run -m anthropic/claude-sonnet-4-5 '
+            Use specter to browse Y Combinator News active discussions (nix run nixpkgs#lynx -- https://news.ycombinator.com/active).
+            Pick the most interesting story and write ./hn-pick.md with the title, link, and why it caught your attention.
+          '
+
+      - name: Today's pick
+        if: always()
+        run: cat hn-pick.md 2>/dev/null || echo "No pick generated"

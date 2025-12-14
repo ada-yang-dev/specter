@@ -1,0 +1,38 @@
+name: vimgolf
+
+on:
+  workflow_dispatch:
+
+jobs:
+  golf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v24
+
+      - name: Build
+        run: |
+          nix develop --command true
+          nix build nixpkgs#vim --no-link
+          gem install vimgolf
+
+      - name: Pick challenge
+        run: |
+          CHALLENGE=$(vimgolf list | shuf -n1 | awk '{print $1}')
+          echo "challenge=$CHALLENGE" >> $GITHUB_ENV
+          vimgolf show $CHALLENGE
+
+      - name: Vim golf
+        timeout-minutes: 10
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          script -q vimgolf.log nix develop --command opencode run -m anthropic/claude-sonnet-4-5 "
+            Use specter to play vimgolf challenge ${{ env.challenge }}.
+            Run: vimgolf put ${{ env.challenge }}
+            Edit in vim to match the target, :wq when done. Press q to quit when prompted.
+          "
+
+      - name: Verify
+        run: grep "Success! Your output matches" vimgolf.log
