@@ -7,30 +7,33 @@
 module Main where
 
 import Control.Applicative ((<|>))
+import Control.Arrow ((&&&), first)
 import Control.Category ((>>>))
 import Control.Concurrent (forkIO, newMVar, threadDelay, withMVar)
-import Control.Concurrent.Async (async, wait)
+import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, assert, catch)
+import Control.Exception (SomeException, catch)
 import Control.Exception qualified as E
 import Control.Lens hiding ((.=), (|>))
-import Control.Monad (forM, forM_, forever, guard, mfilter, void, when)
+import Control.Monad (forever, guard, mfilter, void, when)
 import Data.Aeson
 import Data.Aeson.Key qualified
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
+import Data.Bits ((.&.))
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC8
 import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.Char (isDigit)
-import Data.Foldable (toList)
+
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as M
-import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Monoid (Endo (..))
-import Data.Sequence (Seq, (|>))
+import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
-import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -83,11 +86,10 @@ tlLength (StrictSeq v) = Seq.length v
 
 tlReplicate n x = x `seq` StrictSeq (Seq.replicate n x)
 
-tlIndex :: Int -> Lens' (StrictSeq a) a
 tlIndex i = lens getter setter
   where
-    getter (StrictSeq v) = assert (i >= 0 && i < Seq.length v) $ Seq.index v i
-    setter (StrictSeq v) val = assert (i >= 0 && i < Seq.length v) $ val `seq` StrictSeq (Seq.update i val v)
+    getter (StrictSeq v) = Seq.index v (max 0 $ min (Seq.length v - 1) i)
+    setter (StrictSeq v) val = val `seq` StrictSeq (Seq.update (max 0 $ min (Seq.length v - 1) i) val v)
 
 tlTake i (StrictSeq v) = StrictSeq (Seq.take i v)
 
@@ -128,26 +130,8 @@ makeLenses ''CursorState
 makeLenses ''SavedCursor
 makeLenses ''Term
 
-mkTerm (width, height) =
-  Term
-    { _termAttrs = blankAttrs,
-      _cursorRow = 0,
-      _cursorCol = 0,
-      _cursorState = CursorState False False,
-      _savedCursor = SavedCursor 0 0 blankAttrs False,
-      _cursorVisible = True,
-      _modeWrap = True,
-      _insertMode = False,
-      _altScreenActive = False,
-      _numCols = width,
-      _numRows = height,
-      _scrollTop = 0,
-      _scrollBottom = height - 1,
-      _scrollBackLines = tlEmpty,
-      _viewportOffset = 0,
-      _termScreen = tlReplicate height (blankLine width),
-      _termAlt = tlReplicate height (blankLine width)
-    }
+mkTerm (w, h) = Term blankAttrs 0 0 (CursorState False False) (SavedCursor 0 0 blankAttrs False) True True False False w h 0 (h - 1) tlEmpty 0 screen screen
+  where screen = tlReplicate h (blankLine w)
 
 activeScreen :: Lens' Term TermLines
 activeScreen = lens getter setter
@@ -164,29 +148,27 @@ cursorLine = lens getter setter
 cursorLineCells :: Lens' Term (V.Vector Cell)
 cursorLineCells = cursorLine . lineCells
 
-vIndex :: Int -> Lens' (V.Vector a) a
-vIndex i = lens (V.! i) (\v x -> v V.// [(i, x)])
+vIndex i = lens (\v -> v V.! clamp v) (\v x -> v V.// [(clamp v, x)]) where clamp v = max 0 $ min (V.length v - 1) i
 
 addScrollBackLines newLines = scrollBackLines %~ ((<> newLines) >>> tlTakeLast 1000)
 
 resetViewport = viewportOffset .~ 0
 
+scrollViewport delta t = t & viewportOffset %~ clamp . (+ delta)
+  where clamp = max 0 . min (tlLength (t ^. scrollBackLines))
+
 processInputEsc input term = case input of
-  "\ESC[5;2~" -> ("", scrollUp (term ^. numRows) term)
-  "\ESC[6;2~" -> ("", scrollDown (term ^. numRows) term)
-  "\ESC[1;2A" -> ("", scrollUp 1 term)
-  "\ESC[1;2B" -> ("", scrollDown 1 term)
-  "\ESC[5;5~" -> ("", scrollUp (term ^. numRows `div` 2) term)
-  "\ESC[6;5~" -> ("", scrollDown (term ^. numRows `div` 2) term)
-  "\ESC[1;2H" -> ("", scrollToTop term)
-  "\ESC[1;2~" -> ("", scrollToTop term)
-  "\ESC[4;2~" -> ("", resetViewport term)
-  "\ESC[1;2F" -> ("", resetViewport term)
+  "\ESC[5;2~" -> ("", scrollViewport (term ^. numRows) term)
+  "\ESC[6;2~" -> ("", scrollViewport (-(term ^. numRows)) term)
+  "\ESC[1;2A" -> ("", scrollViewport 1 term)
+  "\ESC[1;2B" -> ("", scrollViewport (-1) term)
+  "\ESC[5;5~" -> ("", scrollViewport (term ^. numRows `div` 2) term)
+  "\ESC[6;5~" -> ("", scrollViewport (-(term ^. numRows `div` 2)) term)
+  "\ESC[1;2H" -> ("", scrollViewport maxBound term)
+  "\ESC[1;2~" -> ("", scrollViewport maxBound term)
+  "\ESC[4;2~" -> ("", scrollViewport minBound term)
+  "\ESC[1;2F" -> ("", scrollViewport minBound term)
   _ -> (input, term)
-  where
-    scrollUp delta t = t & viewportOffset .~ min (tlLength (t ^. scrollBackLines)) (t ^. viewportOffset + delta)
-    scrollDown delta t = t & viewportOffset .~ max 0 (t ^. viewportOffset - delta)
-    scrollToTop t = t & viewportOffset .~ tlLength (t ^. scrollBackLines)
 
 renderViewport term = T.concat [renderLine r | r <- [0 .. lastRow]] <> "\ESC[0m"
   where
@@ -239,43 +221,22 @@ renderViewport term = T.concat [renderLine r | r <- [0 .. lastRow]] <> "\ESC[0m"
       | otherwise = "\ESC[" <> T.intercalate ";" (filter (not . T.null) codes) <> "m"
       where
         codes = [intCode, italCode, ulCode, invCode, strikeCode, fgCode, bgCode]
-        intCode = case cur ^. attrsIntensity of
-          0 -> if prev ^. attrsIntensity /= 0 then "22" else ""
-          1 -> "1"
-          2 -> "2"
-          _ -> ""
-        italCode
-          | cur ^. attrsItalic == prev ^. attrsItalic = ""
-          | cur ^. attrsItalic = "3"
-          | otherwise = "23"
-        ulCode = case cur ^. attrsUnderline of
-          0 -> if prev ^. attrsUnderline /= 0 then "24" else ""
-          1 -> "4"
-          2 -> "21"
-          _ -> ""
-        invCode
-          | cur ^. attrsInverse == prev ^. attrsInverse = ""
-          | cur ^. attrsInverse = "7"
-          | otherwise = "27"
-        strikeCode
-          | cur ^. attrsStrike == prev ^. attrsStrike = ""
-          | cur ^. attrsStrike = "9"
-          | otherwise = "29"
-        (fg, bg) = if cur ^. attrsInverse then (cur ^. attrsBg, cur ^. attrsFg) else (cur ^. attrsFg, cur ^. attrsBg)
-        (pfg, pbg) = if prev ^. attrsInverse then (prev ^. attrsBg, prev ^. attrsFg) else (prev ^. attrsFg, prev ^. attrsBg)
+        toggle l on off = if cur ^. l /= prev ^. l then if cur ^. l then on else off else ""
+        intCode = case (cur ^. attrsIntensity, prev ^. attrsIntensity) of (0, p) | p /= 0 -> "22"; (1, _) -> "1"; (2, _) -> "2"; _ -> ""
+        italCode = toggle attrsItalic "3" "23"
+        ulCode = case (cur ^. attrsUnderline, prev ^. attrsUnderline) of (0, p) | p /= 0 -> "24"; (1, _) -> "4"; (2, _) -> "21"; _ -> ""
+        invCode = toggle attrsInverse "7" "27"
+        strikeCode = toggle attrsStrike "9" "29"
+        effective a = if a ^. attrsInverse then (a ^. attrsBg, a ^. attrsFg) else (a ^. attrsFg, a ^. attrsBg)
+        (fg, bg) = effective cur
+        (pfg, pbg) = effective prev
         fgCode = if fg == pfg then "" else "38;5;" <> showT fg
         bgCode = if bg == pbg then "" else "48;5;" <> showT bg
 
 data DECPrivateMode = DECOM | DECAWM | DECTCEM | AltScreen | AltScreenSaveCursor
   deriving (Show, Eq, Ord)
 
-intToDECPrivateMode 6 = Just DECOM
-intToDECPrivateMode 7 = Just DECAWM
-intToDECPrivateMode 25 = Just DECTCEM
-intToDECPrivateMode 47 = Just AltScreen
-intToDECPrivateMode 1047 = Just AltScreen
-intToDECPrivateMode 1049 = Just AltScreenSaveCursor
-intToDECPrivateMode _ = Nothing
+intToDECPrivateMode = (`lookup` [(6, DECOM), (7, DECAWM), (25, DECTCEM), (47, AltScreen), (1047, AltScreen), (1049, AltScreenSaveCursor)])
 
 data TermAtom
   = TermAtomVisibleChar !Char
@@ -304,6 +265,8 @@ data CSI
   | CSICursorForward !Int
   | CSICursorBack !Int
   | CSICursorPosition !Int !Int
+  | CSICursorColumn !Int
+  | CSICursorRow !Int
   | CSIEraseInLine !EraseInLineParam
   | CSIEraseInDisplay !EraseInDisplayParam
   | CSIInsertBlankCharacters !Int
@@ -360,27 +323,12 @@ parseControl = do
     then parseEscape
     else pure $ maybe (TermAtomUnknown (T.singleton c)) TermAtomSingleCharacterFunction (singleCharacterFunction c)
 
-singleCharacterFunction = \case
-  '\a' -> Just ControlBell
-  '\b' -> Just ControlBackspace
-  '\r' -> Just ControlCarriageReturn
-  '\n' -> Just ControlLineFeed
-  '\t' -> Just ControlTab
-  '\f' -> Just ControlLineFeed
-  '\v' -> Just ControlLineFeed
-  _ -> Nothing
+singleCharacterFunction = (`lookup` [('\a', ControlBell), ('\b', ControlBackspace), ('\r', ControlCarriageReturn), ('\n', ControlLineFeed), ('\t', ControlTab), ('\f', ControlLineFeed), ('\v', ControlLineFeed)])
 
-parseEscape =
-  anyChar >>= \case
-    '[' -> parseCsi
-    ']' -> parseOsc
-    '7' -> pure $ TermAtomEscapeSequence EscDECSC
-    '8' -> pure $ TermAtomEscapeSequence EscDECRC
-    'M' -> pure $ TermAtomEscapeSequence EscReverseIndex
-    'c' -> pure $ TermAtomEscapeSequence EscRIS
-    '=' -> pure $ TermAtomEscapeSequence EscDECPAM
-    '>' -> pure $ TermAtomEscapeSequence EscDECPNM
-    c -> pure $ TermAtomUnknown ("\ESC" <> T.singleton c)
+parseEscape = anyChar >>= \case
+  '[' -> parseCsi
+  ']' -> parseOsc
+  c -> pure $ maybe (TermAtomUnknown $ "\ESC" <> T.singleton c) TermAtomEscapeSequence $ lookup c [('7', EscDECSC), ('8', EscDECRC), ('M', EscReverseIndex), ('c', EscRIS), ('=', EscDECPAM), ('>', EscDECPNM)]
 
 parseCsi = do
   str <- takeTill (between (0x40, 0x7E) . fromEnum)
@@ -398,8 +346,8 @@ parseCsiComponents str = case parseOnly (parser <* endOfInput) str of
   where
     parser = do
       priv <- option False (char '?' >> pure True)
-      first <- peekChar'
-      args <- if isDigit first || first == ';' then sepBy (option 0 decimal) (char ';') else pure []
+      c <- peekChar'
+      args <- if isDigit c || c == ';' then sepBy (option 0 decimal) (char ';') else pure []
       mode <- anyChar
       pure (priv, listToNonEmpty 0 args, mode)
 
@@ -413,8 +361,8 @@ parseStdCsi 'C' args = Just $ CSICursorForward (arg1 args)
 parseStdCsi 'D' args = Just $ CSICursorBack (arg1 args)
 parseStdCsi 'H' args = Just $ CSICursorPosition (max 1 (NE.head args)) (max 1 (getArg 1 args))
 parseStdCsi 'f' args = Just $ CSICursorPosition (max 1 (NE.head args)) (max 1 (getArg 1 args))
-parseStdCsi 'G' args = Just $ CSICursorPosition 0 (arg1 args)
-parseStdCsi 'd' args = Just $ CSICursorPosition (arg1 args) 0
+parseStdCsi 'G' args = Just $ CSICursorColumn (arg1 args)
+parseStdCsi 'd' args = Just $ CSICursorRow (arg1 args)
 parseStdCsi 'K' args =
   CSIEraseInLine <$> case NE.head args of
     0 -> Just ClearFromCursorToEndOfLine
@@ -452,39 +400,28 @@ getArg n (x :| xs) = fromMaybe 0 $ listToMaybe $ drop n (x : xs)
 zeroToNothing = mfilter (/= 0) . Just
 
 parseOsc = do
-  str <- T.pack <$> manyTill' anyChar (char '\a' <|> (string "\ESC\\" >> pure ' '))
-  pure $ maybe (TermAtomUnknown ("\ESC]" <> str)) (TermAtomEscapeSequence . EscOSC) (processOsc str)
+  str <- T.take 66 <$> takeTill (< ' ')
+  _ <- option ' ' (char '\a' <|> (string "\ESC\\" >> pure ' '))
+  pure $ case T.uncons str >>= \(c, r) -> T.uncons r >>= \(semi, title) -> T.take 64 title <$ guard (c `elem` ("012" :: String) && semi == ';') of
+    Just title -> TermAtomEscapeSequence $ EscOSC $ OSCSetTitle title
+    Nothing -> TermAtomUnknown $ "\ESC]" <> str
 
-processOsc str = do
-  (c, rest) <- T.uncons str
-  (';', title) <- T.uncons rest
-  OSCSetTitle title <$ guard (c `elem` ("012" :: String))
-
-parseSGRCodes [] = [SGRReset]
-parseSGRCodes (0 : rest) = SGRReset : parseSGRCodes rest
-parseSGRCodes (1 : rest) = SGRBold : parseSGRCodes rest
-parseSGRCodes (2 : rest) = SGRFaint : parseSGRCodes rest
-parseSGRCodes (3 : rest) = SGRItalic : parseSGRCodes rest
-parseSGRCodes (4 : rest) = SGRUnderline : parseSGRCodes rest
-parseSGRCodes (7 : rest) = SGRInverse : parseSGRCodes rest
-parseSGRCodes (9 : rest) = SGRStrike : parseSGRCodes rest
-parseSGRCodes (21 : rest) = SGRDoubleUnderline : parseSGRCodes rest
-parseSGRCodes (22 : rest) = SGRNormal : parseSGRCodes rest
-parseSGRCodes (23 : rest) = SGRNoItalic : parseSGRCodes rest
-parseSGRCodes (24 : rest) = SGRNoUnderline : parseSGRCodes rest
-parseSGRCodes (27 : rest) = SGRNoInverse : parseSGRCodes rest
-parseSGRCodes (29 : rest) = SGRNoStrike : parseSGRCodes rest
-parseSGRCodes (39 : rest) = SGRFgColor 7 : parseSGRCodes rest
-parseSGRCodes (49 : rest) = SGRBgColor 0 : parseSGRCodes rest
-parseSGRCodes (c : rest) | c >= 30 && c <= 37 = SGRFgColor (fromIntegral $ c - 30) : parseSGRCodes rest
-parseSGRCodes (c : rest) | c >= 90 && c <= 97 = SGRFgColor (fromIntegral $ c - 90 + 8) : parseSGRCodes rest
-parseSGRCodes (c : rest) | c >= 40 && c <= 47 = SGRBgColor (fromIntegral $ c - 40) : parseSGRCodes rest
-parseSGRCodes (c : rest) | c >= 100 && c <= 107 = SGRBgColor (fromIntegral $ c - 100 + 8) : parseSGRCodes rest
-parseSGRCodes (38 : 5 : n : rest) = SGRFgColor (fromIntegral $ max 0 (min 255 n)) : parseSGRCodes rest
-parseSGRCodes (48 : 5 : n : rest) = SGRBgColor (fromIntegral $ max 0 (min 255 n)) : parseSGRCodes rest
-parseSGRCodes (38 : 2 : _ : _ : _ : rest) = parseSGRCodes rest
-parseSGRCodes (48 : 2 : _ : _ : _ : rest) = parseSGRCodes rest
-parseSGRCodes (_ : rest) = parseSGRCodes rest
+parseSGRCodes = \case
+  [] -> [SGRReset]
+  38 : 5 : n : rest -> SGRFgColor (fromIntegral $ limit 0 255 n) : parseSGRCodes rest
+  48 : 5 : n : rest -> SGRBgColor (fromIntegral $ limit 0 255 n) : parseSGRCodes rest
+  38 : 2 : _ : _ : _ : rest -> parseSGRCodes rest
+  48 : 2 : _ : _ : _ : rest -> parseSGRCodes rest
+  c : rest -> maybe id (:) (sgrCode c) $ parseSGRCodes rest
+  where
+    sgrCode c = lookup c basic <|> fgColor c <|> bgColor c
+    basic = [(0, SGRReset), (1, SGRBold), (2, SGRFaint), (3, SGRItalic), (4, SGRUnderline), (7, SGRInverse), (9, SGRStrike), (21, SGRDoubleUnderline), (22, SGRNormal), (23, SGRNoItalic), (24, SGRNoUnderline), (27, SGRNoInverse), (29, SGRNoStrike), (39, SGRFgColor 7), (49, SGRBgColor 0)]
+    fgColor c | c >= 30 && c <= 37 = Just $ SGRFgColor (fromIntegral $ c - 30)
+              | c >= 90 && c <= 97 = Just $ SGRFgColor (fromIntegral $ c - 82)
+              | otherwise = Nothing
+    bgColor c | c >= 40 && c <= 47 = Just $ SGRBgColor (fromIntegral $ c - 40)
+              | c >= 100 && c <= 107 = Just $ SGRBgColor (fromIntegral $ c - 92)
+              | otherwise = Nothing
 
 isCtrl c = fromEnum c <= 0x1F || c == '\DEL'
 
@@ -499,7 +436,7 @@ processTermAtom = \case
 processSCF = \case
   ControlBell -> id
   ControlBackspace -> moveCol (subtract 1)
-  ControlTab -> \t -> t & cursorCol %~ \c -> min (t ^. numCols - 1) (((c + 8) `div` 8) * 8)
+  ControlTab -> \t -> t & cursorCol %~ min (t ^. numCols - 1) . \c -> ((c + 8) `div` 8) * 8
   ControlLineFeed -> processLF
   ControlCarriageReturn -> cursorCol .~ 0
 
@@ -508,30 +445,22 @@ processEsc = \case
   EscRIS -> resetTerm
   EscDECSC -> saveCursor
   EscDECRC -> restoreCursor
-  EscDECPAM -> id
-  EscDECPNM -> id
   EscCSI csi -> processCSI csi
-  EscOSC _ -> id
+  _ -> id
 
 saveCursor t = t & savedCursor .~ SavedCursor (t ^. cursorRow) (t ^. cursorCol) (t ^. termAttrs) (t ^. cursorState . origin)
 
-restoreCursor t =
-  t
-    & cursorRow .~ sc ^. savedRow
-    & cursorCol .~ sc ^. savedCol
-    & termAttrs .~ sc ^. savedAttrs
-    & cursorState . origin .~ sc ^. savedOrigin
-  where
-    sc = t ^. savedCursor
+restoreCursor t = t & cursorRow .~ (sc ^. savedRow) & cursorCol .~ (sc ^. savedCol) & termAttrs .~ (sc ^. savedAttrs) & cursorState . origin .~ (sc ^. savedOrigin)
+  where sc = t ^. savedCursor
 
 processCSI = \case
   CSICursorUp n -> moveRow (subtract n)
   CSICursorDown n -> moveRow (+ n)
   CSICursorForward n -> moveCol (+ n)
   CSICursorBack n -> moveCol (subtract n)
-  CSICursorPosition 0 col -> moveCol (const (col - 1))
-  CSICursorPosition row 0 -> setRowAbs (row - 1)
   CSICursorPosition row col -> cursorMoveAbsoluteTo (row - 1, col - 1)
+  CSICursorColumn col -> moveCol $ const (col - 1)
+  CSICursorRow row -> setRowAbs (row - 1)
   CSIEraseInLine p -> eraseInLine p
   CSIEraseInDisplay p -> eraseInDisplay p
   CSIInsertBlankCharacters n -> insertBlankChars n
@@ -546,12 +475,9 @@ processCSI = \case
   CSIDECSET m -> termProcessDec True m
   CSIDECRST m -> termProcessDec False m
   CSISGR sgrs -> termAttrs %~ appEndo (foldMap (Endo . applySGR) sgrs)
-  CSIDeviceStatusReport _ -> id
-  CSIDA1 -> id
   CSISetMode 4 -> insertMode .~ True
-  CSISetMode _ -> id
   CSIResetMode 4 -> insertMode .~ False
-  CSIResetMode _ -> id
+  _ -> id
 
 moveRow f t = cursorMoveTo (f (t ^. cursorRow), t ^. cursorCol) t
 
@@ -711,50 +637,25 @@ data Terminal = Terminal
   { termPty :: Pty,
     termPh :: ProcessHandle,
     termTerm :: TVar Term,
-    termParseState :: TVar Text
+    termParseState :: TVar Text,
+    termByteBuffer :: TVar ByteString,
+    termTitle :: TVar Text
   }
 
-data Workspace = Workspace
-  { wsOwned :: TVar (S.Set Word64),
-    wsCurrent :: TVar (Maybe Word64)
-  }
-
-data LinkedMap k v = LinkedMap !(M.Map k v) !(Seq k)
-
-lmEmpty = LinkedMap M.empty Seq.empty
-
-lmLookup k (LinkedMap m _) = M.lookup k m
-
-lmInsert k v (LinkedMap m s) = LinkedMap (M.insert k v m) (s |> k)
-
-lmDelete k (LinkedMap m s) = LinkedMap (M.delete k m) (Seq.filter (/= k) s)
-
-lmElems (LinkedMap m _) = M.elems m
-
-lmToList (LinkedMap m _) = M.toList m
-
-lmTrim maxSize (LinkedMap m s)
-  | Seq.length s <= maxSize = ([], LinkedMap m s)
-  | otherwise = (trimmed, LinkedMap m' s')
+splitUtf8 bs
+  | BS.null bs || len - start <= utf8Len (BS.index bs start) = (bs, BS.empty)
+  | otherwise = BS.splitAt start bs
   where
-    excess = Seq.length s - maxSize
-    toTrim = toList $ Seq.take excess s
-    trimmed = mapMaybe (\k -> (k,) <$> M.lookup k m) toTrim
-    m' = foldl' (flip M.delete) m toTrim
-    s' = Seq.drop excess s
+    len = BS.length bs
+    start = until (\i -> i <= 0 || BS.index bs i .&. 0xC0 /= 0x80) (subtract 1) (len - 1)
+    utf8Len b = if | b .&. 0x80 == 0 -> 1 | b .&. 0xE0 == 0xC0 -> 2 | b .&. 0xF0 == 0xE0 -> 3 | b .&. 0xF8 == 0xF0 -> 4 | otherwise -> 1
 
 data Env = Env
   { envTerminals :: TVar (M.Map Word64 Terminal),
-    envFloating :: TVar (S.Set Word64),
-    envActive :: TVar (M.Map Word64 Workspace),
-    envOrphans :: TVar (LinkedMap Word64 Workspace),
-    envNextTermId :: TVar Word64,
-    envNextWsId :: TVar Word64
+    envCurrent :: TVar (Maybe Word64)
   }
 
-maxOrphans = 1024
-
-type ClientAttached = TVar (Maybe Word64)
+lowestAvailable m = until (`M.notMember` m) (+1) 0
 
 data Request = Request (Maybe Value) Text (Maybe Value)
 
@@ -765,16 +666,14 @@ respond rid result = encode $ object ["jsonrpc" .= ("2.0" :: Text), "id" .= rid,
 
 tools =
   toJSON
-    [ tool "attach" "Attach to workspace by ID or create new → {id, created}" [("id", "integer", False)],
-      tool "spawn_terminal" "Spawn terminal with command (default: $SHELL, 160x40). Returns terminal id." [("cmd", "string", False), ("width", "integer", False), ("height", "integer", False)],
+    [ tool "spawn_terminal" "Spawn terminal with command (default: $SHELL, 160x40). Returns terminal id." [("cmd", "string", False), ("width", "integer", False), ("height", "integer", False)],
+      tool "close_terminal" "Close terminal and free its ID" [("terminal", "integer", False)],
       tool "focus_terminal" "Switch current terminal" [("terminal", "integer", True)],
-      tool "list_terminals" "List terminal IDs in workspace" [],
+      tool "list_terminals" "List terminal IDs" [],
       tool "read" "Read terminal viewport exactly as displayed, with ANSI color codes preserved. Use Shift+PageUp/Down sequences to scroll." [("terminal", "integer", False)],
       tool "write" "Send input to terminal. Use \\r for Enter, \\u0003 for Ctrl+C, \\u001b for Escape. Double backslashes are halved: \\\\u001b becomes ESC byte." [("terminal", "integer", False), ("input", "string", True)],
       tool "signal" "Send signal: int (SIGINT), term (SIGTERM), kill (SIGKILL)" [("terminal", "integer", False), ("signal", "string", True)],
-      tool "resize" "Resize PTY + SIGWINCH" [("terminal", "integer", False), ("width", "integer", True), ("height", "integer", True)],
-      tool "float_terminal" "Move terminal to floating pool → id" [("terminal", "integer", True)],
-      tool "grab_floating" "Move floating terminal into workspace → id" [("id", "integer", True)]
+      tool "resize" "Resize PTY + SIGWINCH" [("terminal", "integer", False), ("width", "integer", True), ("height", "integer", True)]
     ]
   where
     tool :: Text -> Text -> [(Key, Text, Bool)] -> Value
@@ -802,312 +701,152 @@ param :: (FromJSON a) => Text -> Value -> Maybe a
 param k (Object o) = parseMaybe (.: Data.Aeson.Key.fromText k) o
 param _ _ = Nothing
 
-spawnTerminal' Env {..} Workspace {..} mCmd (width, height) = do
+spawnTerminal' Env {..} mCmd (width, height) = do
   shell <- fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
   let (cmd, args) = maybe (shell, []) (\c -> (shell, ["-c", c])) mCmd
   baseEnv <- getEnvironment
-  let penv =
-        [("COLUMNS", show width), ("LINES", show height), ("TERM", "xterm-256color")]
-          ++ filter (\(k, _) -> k `notElem` ["COLUMNS", "LINES", "TERM"]) baseEnv
+  let penv = [("COLUMNS", show width), ("LINES", show height), ("TERM", "xterm-256color")]
+           ++ filter ((`notElem` ["COLUMNS", "LINES", "TERM"]) . fst) baseEnv
   (pty, ph) <- spawnWithPty (Just penv) True cmd args (width, height)
   termVar <- newTVarIO $ mkTerm (width, height)
   parseVar <- newTVarIO T.empty
-  let term = Terminal pty ph termVar parseVar
+  byteVar <- newTVarIO BS.empty
+  titleVar <- newTVarIO $ T.pack $ fromMaybe cmd mCmd
+  let term = Terminal pty ph termVar parseVar byteVar titleVar
   void $ async $ reader pty term
   tid <- atomically $ do
-    tid <- readTVar envNextTermId
-    modifyTVar' envNextTermId (+ 1)
-    modifyTVar' envTerminals (M.insert tid term)
-    modifyTVar' wsOwned (S.insert tid)
-    writeTVar wsCurrent (Just tid)
+    terms <- readTVar envTerminals
+    let tid = lowestAvailable terms
+    writeTVar envTerminals (M.insert tid term terms)
+    writeTVar envCurrent (Just tid)
     pure tid
-  void $ async $ do
-    _ <- waitForProcess ph
-    atomically $ cleanupTerminal envTerminals envFloating envActive envOrphans tid
-    ignoreExc (closePty pty)
+  void $ async $ waitForProcess ph >> ignoreExc (closePty pty)
   pure (tid, term)
   where
-    reader pty Terminal {..} =
-      forever $
-        ( tryReadPty pty >>= \case
-            Left _ -> threadDelay 10000
-            Right bs -> do
-              atoms <- atomically $ do
-                leftover <- readTVar termParseState
-                let input = leftover <> TE.decodeUtf8Lenient bs
-                    (atoms, remaining) = parseAtoms input
-                writeTVar termParseState remaining
-                modifyTVar' termTerm (resetViewport . flip processTermAtoms atoms)
-                pure atoms
-              forM_ atoms $ \case
-                TermAtomEscapeSequence (EscCSI CSIDA1) -> void $ writePty termPty "\ESC[?1;2c"
-                _ -> pure ()
-        )
-          `catch` \(_ :: SomeException) -> threadDelay 100000
+    reader pty Terminal {..} = loop where
+      loop = (tryReadPty pty >>= either (const $ threadDelay 10000 >> loop) process) `catch` \(_ :: SomeException) -> pure ()
+      process bs = do
+        atoms <- atomically $ do
+          (prevBytes, prevText) <- (,) <$> readTVar termByteBuffer <*> readTVar termParseState
+          let (complete, incomplete) = splitUtf8 (prevBytes <> bs)
+              (atoms, remaining) = parseAtoms (prevText <> TE.decodeUtf8Lenient complete)
+              newTitle = listToMaybe [t | TermAtomEscapeSequence (EscOSC (OSCSetTitle t)) <- atoms]
+          writeTVar termByteBuffer incomplete >> writeTVar termParseState remaining
+          mapM_ (writeTVar termTitle) newTitle
+          atoms <$ modifyTVar' termTerm (resetViewport . flip processTermAtoms atoms)
+        when (TermAtomEscapeSequence (EscCSI CSIDA1) `elem` atoms) $ void $ writePty termPty "\ESC[?1;2c"
+        loop
 
-cleanupTerminal envTerminals envFloating envActive envOrphans tid = do
-  modifyTVar' envTerminals (M.delete tid)
-  floating <- readTVar envFloating
-  if S.member tid floating
-    then modifyTVar' envFloating (S.delete tid)
-    else do
-      let removeFromWs Workspace {..} = modifyTVar' wsOwned (S.delete tid) >> modifyTVar' wsCurrent (mfilter (/= tid))
-      mapM_ removeFromWs . M.elems =<< readTVar envActive
-      orphans <- readTVar envOrphans
-      emptyWids <- forM (lmToList orphans) \(wid, ws) -> do
-        removeFromWs ws
-        owned <- readTVar (wsOwned ws)
-        pure $ wid <$ guard (S.null owned)
-      mapM_ (modifyTVar' envOrphans . lmDelete) (catMaybes emptyWids)
+parseAtoms t = case parse parseTermAtom t of
+  Done rest atom -> first (atom :) $ parseAtoms rest
+  Partial k -> case k T.empty of
+    Done rest atom -> first (atom :) $ parseAtoms rest
+    _ -> ([], t)
+  Fail {} -> ([], t)
 
-parseAtoms = go []
-  where
-    go acc t = case parse parseTermAtom t of
-      Done rest atom -> go (atom : acc) rest
-      Partial k -> case k T.empty of
-        Done rest atom -> go (atom : acc) rest
-        _ -> (reverse acc, t)
-      Fail {} -> (reverse acc, t)
-
-getTerminal Env {..} Workspace {..} mId = atomically $ do
-  owned <- readTVar wsOwned
-  current <- readTVar wsCurrent
+getTerminal Env {..} mId = atomically $ do
+  current <- readTVar envCurrent
   terms <- readTVar envTerminals
-  case mId <|> current of
-    Nothing -> pure $ Left "no terminal (spawn or specify one)"
-    Just i
-      | S.member i owned -> pure $ maybe (Left "terminal not found") (Right . (i,)) (M.lookup i terms)
-      | otherwise -> pure $ Left "terminal not owned by workspace"
+  pure $ case mId <|> current of
+    Nothing -> Left "no terminal (spawn or specify one)"
+    Just i -> maybe (Left "terminal not found") (Right . (i,)) (M.lookup i terms)
 
-getOwnedWorkspace Env {..} att = atomically $ do
-  readTVar att >>= \case
-    Nothing -> pure Nothing
-    Just wid -> fmap (wid,) . M.lookup wid <$> readTVar envActive
+withTerminal env mTerm f = getTerminal env mTerm >>= either (pure . err) (f . snd)
 
-withWorkspace env att f = getOwnedWorkspace env att >>= maybe (pure $ err "not attached to any workspace") (uncurry f)
+getStatus Env {..} = atomically $
+  (\t c -> showT (M.size t) <> " terminals, current: " <> maybe "none" showT c)
+    <$> readTVar envTerminals <*> readTVar envCurrent
 
-withTerminal env att mTerm f = withWorkspace env att \_ ws -> getTerminal env ws mTerm >>= either (pure . err) (f . snd)
+listTerminals Env {..} = readTVarIO envTerminals >>= fmap (ok . T.unlines) . mapM fmt . M.toList
+  where fmt (tid, Terminal {..}) = (showT tid <>) . (": " <>) <$> readTVarIO termTitle
 
-getStatus Env {..} = atomically $ do
-  active <- readTVar envActive
-  orphans <- readTVar envOrphans
-  floating <- readTVar envFloating
-  activeItems <- forM (M.toList active) \(wid, Workspace {..}) -> do
-    owned <- readTVar wsOwned
-    pure $ "+" <> showT wid <> " (" <> showT (S.size owned) <> " terminals)"
-  orphanItems <- forM (lmToList orphans) \(wid, Workspace {..}) -> do
-    owned <- readTVar wsOwned
-    pure $ "?" <> showT wid <> " (" <> showT (S.size owned) <> " terminals)"
-  let floatItem = ["floating: " <> T.unwords (map showT (S.toList floating)) | not (S.null floating)]
-  pure $ case activeItems ++ orphanItems ++ floatItem of
-    [] -> "no workspaces"
-    items -> T.unlines items
+readTerminal env mTerm = withTerminal env mTerm \Terminal {..} ->
+  ok . renderViewport <$> readTVarIO termTerm
 
-listTerminals env att =
-  getOwnedWorkspace env att >>= \case
-    Nothing -> pure $ err "not attached to any workspace"
-    Just (_, Workspace {..}) -> do
-      owned <- readTVarIO wsOwned
-      pure $ ok $ T.unwords $ map showT $ S.toList owned
+writeTerminal env mTerm input = withTerminal env mTerm \Terminal {..} ->
+  atomically (stateTVar termTerm (processInputEsc input)) >>= \case
+    "" -> pure $ ok "scrolled"
+    ptyInput -> tryIO $ writePty termPty (TE.encodeUtf8 ptyInput) >> pure (ok "sent")
 
-readTerminal env att mTerm = withTerminal env att mTerm \Terminal {..} -> do
-  screen <- readTVarIO termTerm
-  pure $ ok $ renderViewport screen
-
-writeTerminal env att mTerm input = withTerminal env att mTerm \Terminal {..} -> do
-  ptyInput <- atomically $ stateTVar termTerm (processInputEsc input)
-  if T.null ptyInput
-    then pure $ ok "scrolled"
-    else tryIO $ writePty termPty (TE.encodeUtf8 ptyInput) >> pure (ok "sent")
-
-signalTerminal env att mTerm sig = withTerminal env att mTerm \Terminal {..} ->
+signalTerminal env mTerm sig = withTerminal env mTerm \Terminal {..} ->
   getPid termPh >>= maybe (pure $ err "no pid") \pid ->
     tryIO $ signalProcess s pid >> pure (ok $ "sent " <> sig)
-  where
-    s = case T.toLower sig of "int" -> sigINT; "term" -> sigTERM; "kill" -> sigKILL; _ -> sigTERM
+  where s = case T.toLower sig of "int" -> sigINT; "kill" -> sigKILL; _ -> sigTERM
 
-resizeTerminal env att mTerm w h = withTerminal env att mTerm \Terminal {..} -> do
+resizeTerminal env mTerm w h = withTerminal env mTerm \Terminal {..} -> do
+  atomically $ modifyTVar' termTerm $ \t -> t & numCols .~ w & numRows .~ h & scrollTop .~ 0 & scrollBottom .~ (h - 1)
+    & cursorRow %~ min (h - 1) & cursorCol %~ min (w - 1) & activeScreen %~ rs (t ^. termAttrs) & termAlt %~ rs (t ^. termAttrs)
   resizePty termPty (w, h)
-  atomically $ modifyTVar' termTerm $ \t ->
-    t
-      & numCols .~ w
-      & numRows .~ h
-      & scrollTop .~ 0
-      & scrollBottom .~ (h - 1)
-      & cursorRow %~ min (h - 1)
-      & cursorCol %~ min (w - 1)
-      & activeScreen %~ resizeScreen w h (t ^. termAttrs)
-      & termAlt %~ resizeScreen w h (t ^. termAttrs)
   getPid termPh >>= mapM_ (signalProcess sigWINCH)
   pure $ ok $ "resized to " <> showT w <> "x" <> showT h
   where
-    resizeScreen newW newH attrs oldScreen =
-      let blank = blankLineWith newW attrs
-          resizeLine (TermLine cells wrapped) =
-            let newCells = if V.length cells >= newW then V.take newW cells else cells <> V.replicate (newW - V.length cells) (' ', attrs)
-             in TermLine newCells wrapped
-       in if tlLength oldScreen >= newH
-            then tlTakeLast newH $ fmap resizeLine oldScreen
-            else fmap resizeLine oldScreen <> tlReplicate (newH - tlLength oldScreen) blank
+    rs attrs s = let s' = rl <$> s in if tlLength s' >= h then tlTakeLast h s' else s' <> tlReplicate (h - tlLength s') (blankLineWith w attrs)
+      where rl (TermLine cells wrap) = TermLine (if V.length cells >= w then V.take w cells else cells <> V.replicate (w - V.length cells) (' ', attrs)) wrap
 
 (defaultWidth, defaultHeight) = (160, 40)
 
-spawnTerminal env att mCmd mWidth mHeight =
-  withWorkspace env att \_ ws -> tryIO $ do
-    (tid, _) <- spawnTerminal' env ws mCmd (fromMaybe defaultWidth mWidth, fromMaybe defaultHeight mHeight)
-    pure $ ok $ showT tid
+spawnTerminal env mCmd mWidth mHeight = tryIO $ do
+  (tid, _) <- spawnTerminal' env mCmd (fromMaybe defaultWidth mWidth, fromMaybe defaultHeight mHeight)
+  pure $ ok $ showT tid
 
-focusTerminal env att i = withWorkspace env att \_ Workspace {..} -> do
-  focused <-
-    atomically $
-      readTVar wsOwned >>= \owned ->
-        if S.member i owned then writeTVar wsCurrent (Just i) >> pure True else pure False
-  pure $ if focused then ok $ "focused terminal " <> showT i else err "no such terminal"
+focusTerminal Env {..} i = atomically $ do
+  terms <- readTVar envTerminals
+  if M.member i terms
+    then Just i <$ writeTVar envCurrent (Just i)
+    else pure Nothing
+  >>= pure . maybe (err "no such terminal") (\tid -> ok $ "focused " <> showT tid)
 
-floatTerminal env@Env {..} att i = withWorkspace env att \_ Workspace {..} ->
-  atomically $ do
-    owned <- readTVar wsOwned
-    if S.member i owned
-      then do
-        modifyTVar' wsOwned (S.delete i)
-        modifyTVar' wsCurrent (mfilter (/= i))
-        modifyTVar' envFloating (S.insert i)
-        pure $ ok $ "floated " <> showT i
-      else pure $ err "terminal not owned by workspace"
+closeTerminal Env {..} mTid = do
+  result <- atomically $ do
+    current <- readTVar envCurrent
+    let tid = fromMaybe 0 (mTid <|> current)
+    stateTVar envTerminals (M.lookup tid &&& M.delete tid) >>= \case
+      Nothing -> pure $ Left "no such terminal"
+      Just term -> Right (tid, term) <$ modifyTVar' envCurrent (mfilter (/= tid))
+  case result of
+    Left e -> pure $ err e
+    Right (tid, Terminal {..}) -> do
+      getPid termPh >>= mapM_ (ignoreExc . signalProcess sigKILL)
+      ignoreExc (closePty termPty)
+      pure $ ok $ "closed " <> showT tid
 
-grabFloating env@Env {..} att tid = withWorkspace env att \_ Workspace {..} ->
-  atomically $ do
-    floating <- readTVar envFloating
-    if S.member tid floating
-      then do
-        modifyTVar' envFloating (S.delete tid)
-        modifyTVar' wsOwned (S.insert tid)
-        writeTVar wsCurrent (Just tid)
-        pure $ ok $ "grabbed terminal " <> showT tid
-      else pure $ err "terminal not floating"
-
-attachWorkspace env@Env {..} att mReqId =
-  readTVarIO att >>= \case
-    Just _ -> pure $ err "already attached to a workspace"
-    Nothing -> maybe (createWorkspace env att) tryReconnect mReqId
-  where
-    tryReconnect reqId = do
-      reconnected <-
-        atomically $
-          readTVar envOrphans >>= \orphans ->
-            forM (lmLookup reqId orphans) \ws -> do
-              modifyTVar' envOrphans (lmDelete reqId)
-              modifyTVar' envActive (M.insert reqId ws)
-              writeTVar att (Just reqId)
-              pure reqId
-      maybe (createWorkspace env att) (\wid -> pure $ okAttach wid False) reconnected
-
-createWorkspace Env {..} att = do
-  wid <- atomically $ do
-    wid <- readTVar envNextWsId <* modifyTVar' envNextWsId (+ 1)
-    ws <- Workspace <$> newTVar S.empty <*> newTVar Nothing
-    modifyTVar' envActive (M.insert wid ws)
-    writeTVar att (Just wid)
-    pure wid
-  pure $ okAttach wid True
-
-okAttach wid created =
-  object
-    [ "content" .= [object ["type" .= ("text" :: Text), "text" .= msg]],
-      "workspace" .= wid,
-      "created" .= created
-    ]
-  where
-    msg = (if created then "created " else "attached to ") <> showT wid
-
-killTerminal envTerminals tid = do
-  mTerm <- atomically $ stateTVar envTerminals \terms -> (M.lookup tid terms, M.delete tid terms)
-  forM_ mTerm \Terminal {..} -> do
-    getPid termPh >>= mapM_ (ignoreExc . signalProcess sigKILL)
-    ignoreExc (closePty termPty)
-
-purgeOrphans Env {..} = do
-  orphanWs <- atomically $ stateTVar envOrphans \o -> (lmElems o, lmEmpty)
-  forM_ orphanWs \Workspace {..} ->
-    mapM_ (killTerminal envTerminals) . S.toList =<< readTVarIO wsOwned
-  pure $ ok $ "killed " <> showT (length orphanWs) <> " orphaned workspaces"
-
-handle _ _ "initialize" _ =
+handle _ "initialize" _ =
   pure $
     object
       [ "protocolVersion" .= ("2024-11-05" :: Text),
         "capabilities" .= object ["tools" .= object []],
         "serverInfo" .= object ["name" .= ("specter" :: Text), "version" .= ("1.0.0" :: Text)]
       ]
-handle _ _ "notifications/initialized" _ = pure Null
-handle _ _ "tools/list" _ = pure $ object ["tools" .= tools]
-handle env att "tools/call" (Just p) = call env att (fromMaybe "" $ param @Text "name" p) (fromMaybe (object []) $ param "arguments" p)
-handle env _ "_purge" _ = purgeOrphans env
-handle env _ "_list" _ = ok <$> getStatus env
-handle _ _ m _ = pure $ object ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
+handle _ "notifications/initialized" _ = pure Null
+handle _ "tools/list" _ = pure $ object ["tools" .= tools]
+handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p) (fromMaybe (object []) $ param "arguments" p)
+handle env "_list" _ = ok <$> getStatus env
+handle _ m _ = pure $ object ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
 
-call env att "attach" a = attachWorkspace env att (param @Word64 "id" a)
-call env att "spawn_terminal" a = spawnTerminal env att (T.unpack <$> param @Text "cmd" a) (param @Int "width" a) (param @Int "height" a)
-call env att "focus_terminal" a = focusTerminal env att (fromMaybe 0 $ param @Word64 "terminal" a)
-call env att "list_terminals" _ = listTerminals env att
-call env att "read" a = readTerminal env att (param @Word64 "terminal" a)
-call env att "write" a = writeTerminal env att (param @Word64 "terminal" a) (fromMaybe "" $ param @Text "input" a)
-call env att "signal" a = signalTerminal env att (param @Word64 "terminal" a) (fromMaybe "term" $ param @Text "signal" a)
-call env att "resize" a = resizeTerminal env att (param @Word64 "terminal" a) (fromMaybe 120 $ param @Int "width" a) (fromMaybe 24 $ param @Int "height" a)
-call env att "float_terminal" a = floatTerminal env att (fromMaybe 0 $ param @Word64 "terminal" a)
-call env att "grab_floating" a = grabFloating env att (fromMaybe 0 $ param @Word64 "id" a)
-call _ _ n _ = pure $ err $ "unknown tool: " <> n
+call env "spawn_terminal" a = spawnTerminal env (T.unpack <$> param @Text "cmd" a) (param @Int "width" a) (param @Int "height" a)
+call env "close_terminal" a = closeTerminal env (param @Word64 "terminal" a)
+call env "focus_terminal" a = focusTerminal env (fromMaybe 0 $ param @Word64 "terminal" a)
+call env "list_terminals" _ = listTerminals env
+call env "read" a = readTerminal env (param @Word64 "terminal" a)
+call env "write" a = writeTerminal env (param @Word64 "terminal" a) (fromMaybe "" $ param @Text "input" a)
+call env "signal" a = signalTerminal env (param @Word64 "terminal" a) (fromMaybe "term" $ param @Text "signal" a)
+call env "resize" a = resizeTerminal env (param @Word64 "terminal" a) (fromMaybe 120 $ param @Int "width" a) (fromMaybe 24 $ param @Int "height" a)
+call _ n _ = pure $ err $ "unknown tool: " <> n
 
 handleClient env conn = E.bracket (socketToHandle conn ReadWriteMode) hClose \h -> do
   hSetBuffering h LineBuffering
   lock <- newMVar ()
-  attached <- newTVarIO Nothing
-  handlers <- newTVarIO []
-  let loop = do
-        line <- BL.fromStrict <$> BC8.hGetLine h
-        case eitherDecode line of
-          Left e -> withMVar lock \_ ->
-            BL.hPutStrLn h $ encode $ object ["jsonrpc" .= ("2.0" :: Text), "error" .= object ["code" .= (-32700 :: Int), "message" .= e]]
-          Right (Request Nothing method params) ->
-            void $ handle env attached method params
-          Right (Request (Just rid) method params) -> do
-            a <- async $ do
-              result <- handle env attached method params
-              withMVar lock \_ -> BL.hPutStrLn h (respond (Just rid) result)
-            atomically $ modifyTVar' handlers (a :)
-        loop
-  loop `catch` \(_ :: SomeException) -> pure ()
-  readTVarIO handlers >>= mapM_ wait
-  orphanWorkspaces env attached
-
-orphanWorkspaces env@Env {..} attached =
-  readTVarIO attached >>= mapM_ \wid -> do
-    let go ws@Workspace {..} = do
-          modifyTVar' envActive (M.delete wid)
-          owned <- readTVar wsOwned
-          if S.null owned
-            then pure []
-            else do
-              orphans <- lmInsert wid ws <$> readTVar envOrphans
-              let (trimmed, orphans') = lmTrim maxOrphans orphans
-              writeTVar envOrphans orphans'
-              pure trimmed
-    toTrim <- atomically $ readTVar envActive >>= maybe (pure []) go . M.lookup wid
-    mapM_ (killWorkspace env) toTrim
-
-killWorkspace Env {..} (_, Workspace {..}) =
-  mapM_ (killTerminal envTerminals) . S.toList =<< readTVarIO wsOwned
+  let send = withMVar lock . const . BL.hPutStrLn h
+      loop = (BL.fromStrict <$> BC8.hGetLine h >>= (either parseErr dispatch . eitherDecode) >> loop) `catch` \(_ :: SomeException) -> pure ()
+      parseErr e = send $ encode $ object ["jsonrpc" .= ("2.0" :: Text), "error" .= object ["code" .= (-32700 :: Int), "message" .= e]]
+      dispatch (Request Nothing method params) = void $ handle env method params
+      dispatch (Request (Just rid) method params) = handle env method params >>= send . respond (Just rid)
+  loop
 
 main = do
   doesFileExist sockPath >>= (`when` removeFile sockPath)
-  env <-
-    Env
-      <$> newTVarIO M.empty
-      <*> newTVarIO S.empty
-      <*> newTVarIO M.empty
-      <*> newTVarIO lmEmpty
-      <*> newTVarIO 0
-      <*> newTVarIO 0
+  env <- Env <$> newTVarIO M.empty <*> newTVarIO Nothing
   sock <- socket AF_UNIX Stream 0
-  bind sock (SockAddrUnix sockPath) >> listen sock 5
-  forever $ accept sock >>= forkIO . handleClient env . fst
+  bind sock (SockAddrUnix sockPath)
+  listen sock 5
+  forever $ forkIO . handleClient env . fst =<< accept sock
