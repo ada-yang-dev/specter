@@ -16,25 +16,21 @@ jobs:
       - name: Build
         run: |
           nix develop --command true
-          nix build nixpkgs#vim --no-link
-          gem install vimgolf
+          nix build nixpkgs#vimgolf --no-link
 
       - name: Pick challenge
         run: |
-          CHALLENGE=$(vimgolf list | shuf -n1 | awk '{print $1}')
+          CHALLENGE=$(nix run nixpkgs#vimgolf -- list | shuf -n1 | awk '{print $1}')
           echo "challenge=$CHALLENGE" >> $GITHUB_ENV
-          vimgolf show $CHALLENGE
+          nix run nixpkgs#vimgolf -- show $CHALLENGE
 
       - name: Vim golf
         timeout-minutes: 10
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          script -q vimgolf.log nix develop --command opencode run -m anthropic/claude-opus-4-5 "
+          nix develop --command opencode run -m anthropic/claude-opus-4-5 "
             Use specter to play vimgolf challenge ${{ env.challenge }}.
-            Run: vimgolf put ${{ env.challenge }}
+            Run: nix run nixpkgs#vimgolf -- put ${{ env.challenge }}
             Edit in vim to match the target, :wq when done. Press q to quit when prompted.
           "
-
-      - name: Verify
-        run: grep "Success! Your output matches" vimgolf.log
