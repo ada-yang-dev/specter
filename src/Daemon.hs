@@ -567,12 +567,14 @@ termProcessDec on = \case
   DECOM -> (cursorState . origin .~ on) >>> cursorMoveAbsoluteTo (0, 0)
   DECAWM -> modeWrap .~ on
   DECTCEM -> cursorVisible .~ on
-  AltScreen -> altScreenActive .~ on
+  AltScreen
+    | on -> (altScreenActive .~ True) >>> clearAltScreen
+    | otherwise -> altScreenActive .~ False
   AltScreenSaveCursor
     | on -> saveCursor >>> (altScreenActive .~ True) >>> clearAltScreen
     | otherwise -> (altScreenActive .~ False) >>> restoreCursor
-    where
-      clearAltScreen t = t & termAlt .~ tlReplicate (t ^. numRows) (blankLine (t ^. numCols))
+  where
+    clearAltScreen t = t & termAlt .~ tlReplicate (t ^. numRows) (blankLine (t ^. numCols))
 
 applySGR = \case
   SGRReset -> const blankAttrs
