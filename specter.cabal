@@ -7,22 +7,7 @@ license-file:  LICENSE
 build-type:    Simple
 
 executable specter
-  main-is:          Client.hs
-  hs-source-dirs:   src
-  default-language: GHC2024
-  ghc-options:      -threaded -O2 -Wall -Wextra -Werror -Wno-missing-signatures
-  build-depends:
-    , aeson
-    , async
-    , base
-    , bytestring
-    , filepath
-    , network
-    , process
-    , text
-
-executable specterd
-  main-is:          Daemon.hs
+  main-is:          Specter.hs
   hs-source-dirs:   src
   default-language: GHC2024
   ghc-options:      -threaded -O2 -Wall -Wextra -Werror -Wno-missing-signatures
@@ -34,6 +19,8 @@ executable specterd
     , bytestring
     , containers
     , directory
+    , http-client
+    , http-client-tls
     , lens
     , network
     , posix-pty

@@ -7,46 +7,42 @@
 module Main where
 
 import Control.Applicative ((<|>))
-import Control.Arrow ((&&&), first)
+import Control.Arrow (first)
 import Control.Category ((>>>))
-import Control.Concurrent (forkIO, newMVar, threadDelay, withMVar)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
-import Control.Exception qualified as E
 import Control.Lens hiding ((.=), (|>))
-import Control.Monad (forever, guard, mfilter, void, when)
+import Control.Monad (forever, guard, mfilter, unless, void, when)
 import Data.Aeson
-import Data.Aeson.Key qualified
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.ByteString.Char8 qualified as BC8
-import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.Char (isDigit)
-
+import Data.Foldable (toList)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NE
-import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, maybeToList)
+import Text.Read (readMaybe)
 import Data.Monoid (Endo (..))
-import Data.Sequence (Seq)
+import Data.Sequence (Seq, (|>))
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
-import Data.Word (Word64, Word8)
-import Network.Socket
-import System.Directory (doesFileExist, removeFile)
-import System.Environment (getEnvironment, lookupEnv)
-import System.IO
+import Data.Word (Word8)
+import Network.HTTP.Client (httpLbs, method, newManager, parseRequest, requestBody, requestHeaders, responseBody)
+import Network.HTTP.Client qualified as HTTP
+import Network.HTTP.Client.TLS (tlsManagerSettings)
+import System.Environment (getArgs, getEnv, getEnvironment, lookupEnv)
 import System.Posix.Pty
-import System.Posix.Signals (sigINT, sigKILL, sigTERM, signalProcess)
-import System.Posix.Signals.Exts (sigWINCH)
-import System.Process (ProcessHandle, getPid, waitForProcess)
+import System.Process (ProcessHandle, waitForProcess)
 import Prelude hiding (takeWhile)
 
 data Attrs = Attrs
@@ -631,8 +627,6 @@ ignoreExc = (`catch` \(_ :: SomeException) -> pure ())
 showT :: (Show a) => a -> Text
 showT = T.pack . show
 
-sockPath = "/tmp/specter.sock"
-
 data Terminal = Terminal
   { termPty :: Pty,
     termPh :: ProcessHandle,
@@ -650,78 +644,23 @@ splitUtf8 bs
     start = until (\i -> i <= 0 || BS.index bs i .&. 0xC0 /= 0x80) (subtract 1) (len - 1)
     utf8Len b = if | b .&. 0x80 == 0 -> 1 | b .&. 0xE0 == 0xC0 -> 2 | b .&. 0xF0 == 0xE0 -> 3 | b .&. 0xF8 == 0xF0 -> 4 | otherwise -> 1
 
-data Env = Env
-  { envTerminals :: TVar (M.Map Word64 Terminal),
-    envCurrent :: TVar (Maybe Word64)
-  }
+newtype Env = Env {envTerminal :: TVar Terminal}
 
-lowestAvailable m = until (`M.notMember` m) (+1) 0
 
-data Request = Request (Maybe Value) Text (Maybe Value)
 
-instance FromJSON Request where
-  parseJSON = withObject "Request" \v -> Request <$> v .:? "id" <*> v .: "method" <*> v .:? "params"
-
-respond rid result = encode $ object ["jsonrpc" .= ("2.0" :: Text), "id" .= rid, "result" .= result]
-
-tools =
-  toJSON
-    [ tool "spawn_terminal" "Spawn terminal with command (default: $SHELL, 160x40). Returns terminal id." [("cmd", "string", False), ("width", "integer", False), ("height", "integer", False)],
-      tool "close_terminal" "Close terminal and free its ID" [("terminal", "integer", False)],
-      tool "focus_terminal" "Switch current terminal" [("terminal", "integer", True)],
-      tool "list_terminals" "List terminal IDs" [],
-      tool "read" "Read terminal viewport exactly as displayed, with ANSI color codes preserved. Use Shift+PageUp/Down sequences to scroll." [("terminal", "integer", False)],
-      tool "write" "Send input to terminal. Use \\r for Enter, \\u0003 for Ctrl+C, \\u001b for Escape. Double backslashes are halved: \\\\u001b becomes ESC byte." [("terminal", "integer", False), ("input", "string", True)],
-      tool "signal" "Send signal: int (SIGINT), term (SIGTERM), kill (SIGKILL)" [("terminal", "integer", False), ("signal", "string", True)],
-      tool "resize" "Resize PTY + SIGWINCH" [("terminal", "integer", False), ("width", "integer", True), ("height", "integer", True)]
-    ]
-  where
-    tool :: Text -> Text -> [(Key, Text, Bool)] -> Value
-    tool n d ps =
-      object
-        [ "name" .= n,
-          "description" .= d,
-          "inputSchema"
-            .= object
-              [ "type" .= ("object" :: Text),
-                "properties" .= object [(p, object ["type" .= t]) | (p, t, _) <- ps],
-                "required" .= [p | (p, _, True) <- ps]
-              ]
-        ]
-
-ok :: Text -> Value
-ok t = object ["content" .= [object ["type" .= ("text" :: Text), "text" .= t]]]
-
-err :: Text -> Value
-err t = object ["isError" .= True, "content" .= [object ["type" .= ("text" :: Text), "text" .= t]]]
-
-tryIO = fmap (either (err . T.pack . show) id) . E.try @SomeException
-
-param :: (FromJSON a) => Text -> Value -> Maybe a
-param k (Object o) = parseMaybe (.: Data.Aeson.Key.fromText k) o
-param _ _ = Nothing
-
-spawnTerminal' Env {..} mCmd (width, height) = do
+spawnShell (width, height) = do
   shell <- fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
-  let (cmd, args) = maybe (shell, []) (\c -> (shell, ["-c", c])) mCmd
   baseEnv <- getEnvironment
   let penv = [("COLUMNS", show width), ("LINES", show height), ("TERM", "xterm-256color")]
            ++ filter ((`notElem` ["COLUMNS", "LINES", "TERM"]) . fst) baseEnv
-  (pty, ph) <- spawnWithPty (Just penv) True cmd args (width, height)
+  (pty, ph) <- spawnWithPty (Just penv) True shell [] (width, height)
   termVar <- newTVarIO $ mkTerm (width, height)
   parseVar <- newTVarIO T.empty
   byteVar <- newTVarIO BS.empty
-  titleVar <- newTVarIO $ T.pack $ fromMaybe cmd mCmd
+  titleVar <- newTVarIO $ T.pack shell
   let term = Terminal pty ph termVar parseVar byteVar titleVar
   void $ async $ reader pty term
-  tid <- atomically $ do
-    terms <- readTVar envTerminals
-    let tid = lowestAvailable terms
-    writeTVar envTerminals (M.insert tid term terms)
-    writeTVar envCurrent (Just tid)
-    pure tid
-  void $ async $ waitForProcess ph >> ignoreExc (closePty pty)
-  pure (tid, term)
+  pure term
   where
     reader pty Terminal {..} = loop where
       loop = (tryReadPty pty >>= either (const $ threadDelay 10000 >> loop) process) `catch` \(_ :: SomeException) -> pure ()
@@ -737,6 +676,8 @@ spawnTerminal' Env {..} mCmd (width, height) = do
         when (TermAtomEscapeSequence (EscCSI CSIDA1) `elem` atoms) $ void $ writePty termPty "\ESC[?1;2c"
         loop
 
+
+
 parseAtoms t = case parse parseTermAtom t of
   Done rest atom -> first (atom :) $ parseAtoms rest
   Partial k -> case k T.empty of
@@ -744,109 +685,134 @@ parseAtoms t = case parse parseTermAtom t of
     _ -> ([], t)
   Fail {} -> ([], t)
 
-getTerminal Env {..} mId = atomically $ do
-  current <- readTVar envCurrent
-  terms <- readTVar envTerminals
-  pure $ case mId <|> current of
-    Nothing -> Left "no terminal (spawn or specify one)"
-    Just i -> maybe (Left "terminal not found") (Right . (i,)) (M.lookup i terms)
+readViewport (Env tv) = renderViewport <$> (readTVarIO tv >>= readTVarIO . termTerm)
 
-withTerminal env mTerm f = getTerminal env mTerm >>= either (pure . err) (f . snd)
-
-getStatus Env {..} = atomically $
-  (\t c -> showT (M.size t) <> " terminals, current: " <> maybe "none" showT c)
-    <$> readTVar envTerminals <*> readTVar envCurrent
-
-listTerminals Env {..} = readTVarIO envTerminals >>= fmap (ok . T.unlines) . mapM fmt . M.toList
-  where fmt (tid, Terminal {..}) = (showT tid <>) . (": " <>) <$> readTVarIO termTitle
-
-readTerminal env mTerm = withTerminal env mTerm \Terminal {..} ->
-  ok . renderViewport <$> readTVarIO termTerm
-
-writeTerminal env mTerm input = withTerminal env mTerm \Terminal {..} ->
+sendKeys (Env tv) input = do
+  Terminal {..} <- readTVarIO tv
   atomically (stateTVar termTerm (processInputEsc input)) >>= \case
-    "" -> pure $ ok "scrolled"
-    ptyInput -> tryIO $ writePty termPty (TE.encodeUtf8 ptyInput) >> pure (ok "sent")
-
-signalTerminal env mTerm sig = withTerminal env mTerm \Terminal {..} ->
-  getPid termPh >>= maybe (pure $ err "no pid") \pid ->
-    tryIO $ signalProcess s pid >> pure (ok $ "sent " <> sig)
-  where s = case T.toLower sig of "int" -> sigINT; "kill" -> sigKILL; _ -> sigTERM
-
-resizeTerminal env mTerm w h = withTerminal env mTerm \Terminal {..} -> do
-  atomically $ modifyTVar' termTerm $ \t -> t & numCols .~ w & numRows .~ h & scrollTop .~ 0 & scrollBottom .~ (h - 1)
-    & cursorRow %~ min (h - 1) & cursorCol %~ min (w - 1) & activeScreen %~ rs (t ^. termAttrs) & termAlt %~ rs (t ^. termAttrs)
-  resizePty termPty (w, h)
-  getPid termPh >>= mapM_ (signalProcess sigWINCH)
-  pure $ ok $ "resized to " <> showT w <> "x" <> showT h
-  where
-    rs attrs s = let s' = rl <$> s in if tlLength s' >= h then tlTakeLast h s' else s' <> tlReplicate (h - tlLength s') (blankLineWith w attrs)
-      where rl (TermLine cells wrap) = TermLine (if V.length cells >= w then V.take w cells else cells <> V.replicate (w - V.length cells) (' ', attrs)) wrap
+    "" -> pure ()
+    ptyInput -> void $ writePty termPty (TE.encodeUtf8 ptyInput)
 
 (defaultWidth, defaultHeight) = (160, 40)
 
-spawnTerminal env mCmd mWidth mHeight = tryIO $ do
-  (tid, _) <- spawnTerminal' env mCmd (fromMaybe defaultWidth mWidth, fromMaybe defaultHeight mHeight)
-  pure $ ok $ showT tid
 
-focusTerminal Env {..} i = atomically $ do
-  terms <- readTVar envTerminals
-  if M.member i terms
-    then Just i <$ writeTVar envCurrent (Just i)
-    else pure Nothing
-  >>= pure . maybe (err "no such terminal") (\tid -> ok $ "focused " <> showT tid)
 
-closeTerminal Env {..} mTid = do
-  result <- atomically $ do
-    current <- readTVar envCurrent
-    let tid = fromMaybe 0 (mTid <|> current)
-    stateTVar envTerminals (M.lookup tid &&& M.delete tid) >>= \case
-      Nothing -> pure $ Left "no such terminal"
-      Just term -> Right (tid, term) <$ modifyTVar' envCurrent (mfilter (/= tid))
-  case result of
-    Left e -> pure $ err e
-    Right (tid, Terminal {..}) -> do
-      getPid termPh >>= mapM_ (ignoreExc . signalProcess sigKILL)
-      ignoreExc (closePty termPty)
-      pure $ ok $ "closed " <> showT tid
+-- Agent
 
-handle _ "initialize" _ =
-  pure $
-    object
-      [ "protocolVersion" .= ("2024-11-05" :: Text),
-        "capabilities" .= object ["tools" .= object []],
-        "serverInfo" .= object ["name" .= ("specter" :: Text), "version" .= ("1.0.0" :: Text)]
-      ]
-handle _ "notifications/initialized" _ = pure Null
-handle _ "tools/list" _ = pure $ object ["tools" .= tools]
-handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p) (fromMaybe (object []) $ param "arguments" p)
-handle env "_list" _ = ok <$> getStatus env
-handle _ m _ = pure $ object ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
+data Msg = Msg {msgRole :: Text, msgContent :: Text}
 
-call env "spawn_terminal" a = spawnTerminal env (T.unpack <$> param @Text "cmd" a) (param @Int "width" a) (param @Int "height" a)
-call env "close_terminal" a = closeTerminal env (param @Word64 "terminal" a)
-call env "focus_terminal" a = focusTerminal env (fromMaybe 0 $ param @Word64 "terminal" a)
-call env "list_terminals" _ = listTerminals env
-call env "read" a = readTerminal env (param @Word64 "terminal" a)
-call env "write" a = writeTerminal env (param @Word64 "terminal" a) (fromMaybe "" $ param @Text "input" a)
-call env "signal" a = signalTerminal env (param @Word64 "terminal" a) (fromMaybe "term" $ param @Text "signal" a)
-call env "resize" a = resizeTerminal env (param @Word64 "terminal" a) (fromMaybe 120 $ param @Int "width" a) (fromMaybe 24 $ param @Int "height" a)
-call _ n _ = pure $ err $ "unknown tool: " <> n
+instance ToJSON Msg where
+  toJSON Msg {..} = object ["role" .= msgRole, "content" .= msgContent]
 
-handleClient env conn = E.bracket (socketToHandle conn ReadWriteMode) hClose \h -> do
-  hSetBuffering h LineBuffering
-  lock <- newMVar ()
-  let send = withMVar lock . const . BL.hPutStrLn h
-      loop = (BL.fromStrict <$> BC8.hGetLine h >>= (either parseErr dispatch . eitherDecode) >> loop) `catch` \(_ :: SomeException) -> pure ()
-      parseErr e = send $ encode $ object ["jsonrpc" .= ("2.0" :: Text), "error" .= object ["code" .= (-32700 :: Int), "message" .= e]]
-      dispatch (Request Nothing method params) = void $ handle env method params
-      dispatch (Request (Just rid) method params) = handle env method params >>= send . respond (Just rid)
-  loop
+data AgentSt = AgentSt
+  { stThinking :: Text       -- compacted thinking history
+  , stRecentKeys :: Seq Text -- last 5 keystrokes
+  }
 
-main = do
-  doesFileExist sockPath >>= (`when` removeFile sockPath)
-  env <- Env <$> newTVarIO M.empty <*> newTVarIO Nothing
-  sock <- socket AF_UNIX Stream 0
-  bind sock (SockAddrUnix sockPath)
-  listen sock 5
-  forever $ forkIO . handleClient env . fst =<< accept sock
+systemPrompt task = T.unlines
+  [ "Autonomous PTY session. Task: " <> task
+  , "Emit ANSI control sequences."
+  , "Suspend: \\x1b_wait:time:SECONDS\\x1b\\\\"
+  ]
+
+agentLoop env cfg stRef = forever do
+  threadDelay 300000
+  viewport <- readViewport env
+  TIO.putStrLn viewport
+  TIO.putStrLn "---"
+  st <- readIORef stRef
+  let prompt = buildPrompt st viewport
+  (thinking, keys) <- askLLM cfg [Msg "user" prompt]
+  unless (T.null thinking) $ TIO.putStrLn $ "\x1b[90m" <> thinking <> "\x1b[0m"
+  TIO.putStrLn $ "\x1b[32m>>> " <> keys <> "\x1b[0m\n"
+  let (apc, ptyKeys) = extractAPC keys
+  unless (T.null ptyKeys) $ sendKeys env ptyKeys
+  execAPC apc
+  let st' = updateState st thinking keys
+  writeIORef stRef =<< if needsCompaction st' then compactState cfg st' else pure st'
+  `catch` \(e :: SomeException) -> print e >> threadDelay 2000000
+
+buildPrompt AgentSt {..} viewport = T.unlines $ filter (not . T.null)
+  [ if T.null stThinking then "" else "Previous reasoning:\n" <> stThinking
+  , if Seq.null stRecentKeys then "" else "Recent keystrokes: " <> T.intercalate " → " (toList stRecentKeys)
+  , "Current terminal:\n" <> viewport
+  ]
+
+updateState st@AgentSt {..} thinking keys = st
+  { stThinking = stThinking <> (if T.null stThinking then "" else "\n\n") <> thinking
+  , stRecentKeys = let new = stRecentKeys |> keys in Seq.drop (max 0 (Seq.length new - 5)) new
+  }
+
+needsCompaction AgentSt {..} = T.length stThinking > 50000
+
+compactState cfg st@AgentSt {..} = do
+  TIO.putStrLn "\x1b[33m[compacting thinking...]\x1b[0m"
+  summary <- summarize cfg stThinking
+  pure $ st {stThinking = summary}
+
+summarize (mgr, key, url, model, _) text = do
+  let body = object
+        [ "model" .= model
+        , "max_tokens" .= (2000 :: Int)
+        , "messages" .= [Msg "user" $ "Summarize this reasoning history concisely, preserving key decisions and insights:\n\n" <> text]
+        ]
+  req <- parseRequest $ T.unpack url
+  let req' = req {method = "POST", requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01"), ("content-type", "application/json")], requestBody = HTTP.RequestBodyLBS $ encode body}
+  resp <- httpLbs req' mgr
+  pure $ fromMaybe text $ decode (responseBody resp) >>= fmap snd . parseResponse
+
+-- APC: \x1b_COMMAND\x1b\\
+-- wait:time:N - wait N seconds (spurious wakeup allowed)
+extractAPC t = case T.breakOn "\x1b_" t of
+  (before, rest) | not (T.null rest) -> case T.breakOn "\x1b\\" (T.drop 2 rest) of
+    (cmd, after) -> (Just cmd, before <> T.drop 2 after)
+  _ -> (Nothing, t)
+
+execAPC Nothing = pure ()
+execAPC (Just cmd)
+  | Just arg <- T.stripPrefix "wait:" cmd = execWait arg
+  | otherwise = TIO.putStrLn $ "\x1b[31m[unknown: " <> cmd <> "]\x1b[0m"
+
+execWait arg
+  | Just secs <- T.stripPrefix "time:" arg, Just n <- readMaybe (T.unpack secs) = do
+      TIO.putStrLn $ "\x1b[33m[wait " <> showT n <> "s]\x1b[0m"
+      threadDelay (n * 1000000)
+  | otherwise = TIO.putStrLn $ "\x1b[31m[unknown wait: " <> arg <> "]\x1b[0m"
+
+
+
+askLLM (mgr, key, url, model, task) msgs = do
+  let body = object
+        [ "model" .= model
+        , "max_tokens" .= (8000 :: Int)
+        , "system" .= systemPrompt task
+        , "thinking" .= object ["type" .= ("enabled" :: Text), "budget_tokens" .= (4000 :: Int)]
+        , "messages" .= msgs ]
+  req <- parseRequest $ T.unpack url
+  let req' = req {method = "POST", requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01"), ("content-type", "application/json")], requestBody = HTTP.RequestBodyLBS $ encode body}
+  resp <- httpLbs req' mgr
+  pure $ fromMaybe ("", "") $ decode (responseBody resp) >>= parseResponse
+
+parseResponse v = do
+  Object o <- pure v
+  Array arr <- parseMaybe (.: "content") o
+  let blocks = toList arr
+      getField typ fld = T.concat [t | Object b <- blocks, String ty <- maybeToList (parseMaybe (.: "type") b), ty == typ, String t <- maybeToList (parseMaybe (.: fld) b)]
+  pure (getField "thinking" "thinking", T.strip $ getField "text" "text")
+
+main = getArgs >>= \case
+  [task] -> agentMain (T.pack task)
+  _ -> TIO.putStrLn "usage: specter 'task'"
+
+agentMain task = do
+  key <- T.pack <$> getEnv "ANTHROPIC_API_KEY"
+  url <- maybe "https://api.anthropic.com/v1/messages" T.pack <$> lookupEnv "API_URL"
+  model <- maybe "claude-sonnet-4-20250514" T.pack <$> lookupEnv "MODEL"
+  mgr <- newManager tlsManagerSettings
+  term <- spawnShell (defaultWidth, defaultHeight)
+  tv <- newTVarIO term
+  stRef <- newIORef $ AgentSt "" Seq.empty
+  TIO.putStrLn $ "=== specter ===\nTask: " <> task <> "\n"
+  void $ async $ agentLoop (Env tv) (mgr, key, url, model, task) stRef
+  void $ waitForProcess (termPh term)
+  TIO.putStrLn "shell exited"
