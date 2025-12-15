@@ -139,7 +139,7 @@ renderViewport t = T.concat [renLine r | r <- [0..lastRow]] <> "\ESC[0m" where
   withCur r c (ch, a) = if showCur && r == curR && c == curC then (ch, a & attrsInverse %~ not) else (ch, a)
 
   renLine r
-    | t^.altScreenActive = renCells blankAttrs [cell r c | c <- [0..cols-1]] <> "\n"
+    | t^.altScreenActive = renCells blankAttrs [cell r c | c <- [0..lastCol r]] <> "\n"
     | otherwise = renCells blankAttrs [withCur r c (cell r c) | c <- [0..lastCol r]]
         <> if hasNL r || lastCol r /= cols - 1 then "\n" else "\ESC[?7w"
 
@@ -408,7 +408,7 @@ makeLenses ''Terminal
 newtype Env = Env (TVar Terminal)
 
 splitUtf8 bs
-  | BS.null bs || len - start <= utf8Len (BS.index bs start) = (bs, BS.empty)
+  | BS.null bs || len - start >= utf8Len (BS.index bs start) = (bs, BS.empty)
   | otherwise = BS.splitAt start bs
   where
     len = BS.length bs
@@ -482,11 +482,11 @@ sysPrompt msg = T.unlines
 agentLoop env cfg stRef = forever (step `catch` \(e :: SomeException) -> print e >> threadDelay 2000000) where
   step = do
     vp <- readViewport env
-    TIO.putStrLn vp >> TIO.putStrLn "---"
+    TIO.putStrLn "<<TERMINAL" >> TIO.putStrLn vp >> TIO.putStrLn "TERMINAL"
     st <- readIORef stRef
     (think, keys) <- askLLM cfg [object ["role" .= ("user" :: Text), "content" .= buildPrompt st vp]]
-    unless (T.null think) $ TIO.putStrLn $ "\x1b[90m" <> think <> "\x1b[0m"
-    TIO.putStrLn $ "\x1b[32m>>> " <> keys <> "\x1b[0m\n"
+    unless (T.null think) $ TIO.putStrLn ("<<THINKING\n" <> think <> "\nTHINKING")
+    TIO.putStrLn $ "KEYS: " <> keys
     let (apc, ptyKeys) = extractAPC keys
     unless (T.null ptyKeys) $ sendKeys env ptyKeys
     execAPC apc
@@ -522,11 +522,12 @@ execAPC = maybe (pure ()) $ \cmd -> case T.stripPrefix "wait:time:" cmd >>= read
 apiCall mgr key url body = do
   req <- HTTP.parseRequest $ T.unpack url
   HTTP.httpLbs req {HTTP.method = "POST", HTTP.requestBody = HTTP.RequestBodyLBS $ encode body
+    , HTTP.responseTimeout = HTTP.responseTimeoutMicro (5 * 60 * 1000000)
     , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01"), ("content-type", "application/json")]} mgr
 
 askLLM (mgr, key, url, model, msg) msgs = fromMaybe ("","") . (decode . HTTP.responseBody >=> parseResp)
-  <$> apiCall mgr key url (object ["model" .= model, "max_tokens" .= (8000::Int), "system" .= sysPrompt msg
-    , "thinking" .= object ["type" .= ("enabled"::Text), "budget_tokens" .= (4000::Int)], "messages" .= msgs])
+  <$> apiCall mgr key url (object ["model" .= model, "max_tokens" .= (2000::Int), "system" .= sysPrompt msg
+    , "thinking" .= object ["type" .= ("enabled"::Text), "budget_tokens" .= (1024::Int)], "messages" .= msgs])
 
 parseResp v = do
   Object o <- pure v; Array arr <- parseMaybe (.: "content") o
@@ -541,7 +542,7 @@ agentMain msg = do
   cfg <- (,,,,) <$> HTTP.newManager tlsManagerSettings <*> (T.pack <$> getEnv "ANTHROPIC_API_KEY")
     <*> envT "https://api.anthropic.com/v1/messages" "API_URL"
     <*> envT "claude-sonnet-4-20250514" "MODEL" <*> pure msg
-  term <- spawnShell (160, 40)
+  term <- spawnShell (80, 24)
   env <- Env <$> newTVarIO term
   stRef <- newIORef $ AgentSt "" "" Seq.empty
   TIO.putStrLn $ "=== specter ===\n" <> msg <> "\n"
