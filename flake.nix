@@ -14,8 +14,7 @@
           (pkgs.haskellPackages.callCabal2nix "specter" ./. {}) (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; }); in {
         default = specter;
         nethack = pkgs.writeShellScriptBin "specter-nethack" ''
-          export PATH="${pkgs.nethack}/bin:$PATH"
-          exec ${specter}/bin/specter "Play a session of NetHack (it's in your PATH). When your adventure ends, reflect on your experience and exit the shell."
+          exec ${specter}/bin/specter ${pkgs.nethack}/bin/nethack "Play NetHack. You're seeing an authentic terminal - the same view a human would see. The @ is you. Top line shows messages (read them!), bottom two lines show your stats. Take your time, stay alive, descend when ready. Have fun exploring."
         '';
       });
 

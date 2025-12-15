@@ -9,7 +9,8 @@ import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Control.Lens hiding ((.=))
-import Control.Monad (forever, mfilter, unless, void, when, (>=>))
+import Control.Monad (forever, mfilter, unless, void, when, (<=<))
+import Data.Bool (bool)
 import Data.Aeson
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
@@ -33,7 +34,7 @@ import Data.Vector qualified as V
 import Data.Word (Word8)
 import Network.HTTP.Client qualified as HTTP
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import System.Environment (getArgs, getEnv, getEnvironment, lookupEnv)
+import System.Environment (getArgs, getEnv, getEnvironment)
 import System.Posix.Pty
 import System.Process (ProcessHandle, waitForProcess)
 
@@ -410,11 +411,10 @@ splitUtf8 bs
     utf8Len b = if | b .&. 0x80 == 0 -> 1 | b .&. 0xE0 == 0xC0 -> 2
                    | b .&. 0xF0 == 0xE0 -> 3 | b .&. 0xF8 == 0xF0 -> 4 | otherwise -> 1
 
-spawnShell (w, h) = do
-  shell <- fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
+spawnPty' cmd (w, h) = do
   penv <- (++ [("COLUMNS", show w), ("LINES", show h), ("TERM", "xterm-256color")])
     . filter ((`notElem` ["COLUMNS","LINES","TERM"]) . fst) <$> getEnvironment
-  (pty, ph) <- spawnWithPty (Just penv) True shell [] (w, h)
+  (pty, ph) <- spawnWithPty (Just penv) True cmd [] (w, h)
   term <- Terminal pty ph <$> newTVarIO (mkTerm (w, h)) <*> newTVarIO "" <*> newTVarIO BS.empty
   term <$ async (ptyReader term)
 
@@ -449,65 +449,76 @@ decodeEscapes = T.pack . go . T.unpack where
 
 -- Agent
 
+cfgModel = "claude-sonnet-4-20250514" :: Text
+cfgApiUrl = "https://api.anthropic.com/v1/messages" :: String
+cfgApiVersion = "2023-06-01" :: BS.ByteString
+cfgThinkingBudget = 16000 :: Int
+cfgMaxTokens = 32000 :: Int
+cfgTimeout = 300000000 :: Int
+cfgPollDelay = 250000 :: Int
+cfgContextLimit = 600000 :: Int
+cfgCompactTarget = 400000 :: Int
+
 data AgentSt = AgentSt {_stMem, _stThink :: Text}
 makeLenses ''AgentSt
 
 sysPrompt msg = T.unlines ["<specter-system>"
-  , "You are using specter, a terminal emulator with ANSI viewport and scrollback."
-  , "Prior responses are in specter-thinking. Long context is summarized into specter-memory."
-  , "Emit escape sequences to the PTY with a specter-emit tag. Example: <specter-emit>ls\\r</specter-emit>"
+  , "You are using specter, a terminal emulator. The viewport below shows what a human would see."
+  , "To send input to the terminal, you MUST call the specter_emit tool. Text responses do not affect the terminal."
+  , "Your prior responses appear in specter-thinking; long context is summarized into specter-memory."
   , "</specter-system>", "", "<specter-message>", msg, "</specter-message>"]
 
-agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
-  wrap tag t = if T.null t then "" else "<specter-" <> tag <> ">\n" <> t <> "\n</specter-" <> tag <> ">"
-  buildPrompt st vp = T.unlines $ filter (not . T.null)
-    [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink, "<specter-terminal>", vp, "</specter-terminal>"]
-  api body = HTTP.parseRequest (T.unpack url) >>= \req -> HTTP.httpLbs req
-    { HTTP.method = "POST", HTTP.requestBody = HTTP.RequestBodyLBS $ encode body
-    , HTTP.responseTimeout = HTTP.responseTimeoutMicro 300000000
-    , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01")
-                            , ("content-type", "application/json")] } mgr
-  ask msgs = fromMaybe "" . (decode . HTTP.responseBody >=> parseText) <$> api
-    (object ["model" .= model, "max_tokens" .= (1500::Int), "system" .= sysPrompt msg, "messages" .= msgs])
-  compact vp st = TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m" >> do
-    let ctx = T.unlines ["<context>", sysPrompt msg, buildPrompt st vp, "</context>"
-          , "Summarize this context into compact memory. Preserve key state and decisions."]
-    newMem <- fromMaybe (st^.stMem) . (decode . HTTP.responseBody >=> parseText)
-      <$> api (object ["model" .= model, "max_tokens" .= (4000::Int)
-          , "messages" .= [object ["role" .= ("user"::Text), "content" .= ctx]]])
-    let cap = 600000 - T.length (sysPrompt msg) - T.length newMem - T.length vp
-    pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 cap)
-  step = threadDelay 250000 >> readViewport env >>= \vp -> do
+emitTool = object ["name" .= t "specter_emit", "description" .= t "Send escape sequences to the PTY"
+  , "input_schema" .= object ["type" .= t "object", "required" .= [t "keys"]
+    , "properties" .= object ["keys" .= object ["type" .= t "string"]]]] where t = id @Text
+
+agentLoop env (mgr, key, msg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
+  wrap tag = maybe "" (\t -> "<specter-" <> tag <> ">\n" <> t <> "\n</specter-" <> tag <> ">") . mfilter (not . T.null) . Just
+  prompt st vp = T.unlines $ filter (not . T.null) [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink
+    , "<specter-terminal>", vp, "</specter-terminal>"]
+  api = fmap (decode . HTTP.responseBody) . (HTTP.httpLbs ?? mgr) <=< mkReq . encode
+  mkReq body = HTTP.parseRequest cfgApiUrl <&> \r -> r { HTTP.method = "POST"
+    , HTTP.requestBody = HTTP.RequestBodyLBS body, HTTP.responseTimeout = HTTP.responseTimeoutMicro cfgTimeout
+    , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", cfgApiVersion), ("content-type", "application/json")] }
+  thinking = ["thinking" .= object ["type" .= t "enabled", "budget_tokens" .= cfgThinkingBudget]] where t = id @Text
+  ask = api . object . (["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "system" .= sysPrompt msg, "tools" .= [emitTool]] ++) . (thinking ++)
+  compact vp st = TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m" >>
+    api (object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "messages" .= [object ["role" .= t "user", "content" .= ctx]]]) <&>
+    \r -> let mem' = fromMaybe (st^.stMem) (r >>= parseText)
+              fixed = T.length (sysPrompt msg) + T.length (prompt (AgentSt mem' "") vp)
+              cap = cfgCompactTarget - fixed
+          in st & stMem .~ mem' & stThink %~ T.takeEnd (max 0 cap) where
+      t = id @Text; ctx = T.unlines ["<context>", sysPrompt msg, prompt st vp, "</context>", "Summarize into compact memory."]
+  step = threadDelay cfgPollDelay >> readViewport env >>= \vp -> do
     TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
     st <- readIORef stRef
-    resp <- truncateAtEmit <$> ask [object ["role" .= ("user" :: Text), "content" .= buildPrompt st vp]]
-    TIO.putStrLn $ "--- RESPONSE ---\n" <> resp
-    unless (T.null $ extractEmit resp) $ sendKeys env (extractEmit resp)
-    let st' = st & stThink %~ (\t -> (if T.null t then "" else t <> "\n\n") <> resp)
-    writeIORef stRef =<< if T.length (st'^.stMem) + T.length (st'^.stThink) > 600000
-      then compact vp st' else pure st'
+    (text, keys) <- fromMaybe ("", "") . (>>= parseResp) <$> ask ["messages" .= [object ["role" .= t "user", "content" .= prompt st vp]]]
+    TIO.putStrLn $ "--- RESPONSE ---\n" <> text
+    unless (T.null keys) $ sendKeys env keys
+    let st' = st & stThink %~ (<> (if T.null (st^.stThink) then "" else "\n\n") <> text)
+    writeIORef stRef =<< bool (pure st') (compact vp st') (T.length (sysPrompt msg) + T.length (prompt st' vp) > cfgContextLimit)
+    where t = id @Text
 
-truncateAtEmit resp = case T.breakOn "<specter-emit>" resp of
-  (_, "") -> resp
-  (before, rest) -> case T.breakOn "</specter-emit>" rest of
-    (_, "") -> resp
-    (mid, _) -> before <> mid <> "</specter-emit>"
-
-extractEmit = fromMaybe "" . listToMaybe . map (fst . T.breakOn "</specter-emit>" . T.drop 14 . snd)
-  . filter (not . T.null . snd . T.breakOn "</specter-emit>" . T.drop 14 . snd) . T.breakOnAll "<specter-emit>"
+parseResp v = do
+  Array arr <- parseMaybe (.: "content") v
+  let blocks = toList arr
+  pure ( T.strip $ T.concat [t | Object b <- blocks, String t <- maybeToList $ parseMaybe (.: "text") b]
+       , T.concat [k | Object b <- blocks, String "tool_use" <- maybeToList (parseMaybe (.: "type") b)
+           , String "specter_emit" <- maybeToList (parseMaybe (.: "name") b)
+           , Object inp <- maybeToList (parseMaybe (.: "input") b), String k <- maybeToList (parseMaybe (.: "keys") inp)])
 
 parseText v = do
   Array arr <- parseMaybe (.: "content") v
-  pure $ T.strip $ T.concat [t | Object b <- toList arr, String t <- maybeToList (parseMaybe (.: "text") b)]
+  pure $ T.strip $ T.concat [t | Object b <- toList arr, String t <- maybeToList $ parseMaybe (.: "text") b]
 
-main = getArgs >>= \case [msg] -> agentMain (T.pack msg); _ -> TIO.putStrLn "usage: specter 'message'"
+main = getArgs >>= \case
+  cmd : msg -> agentMain cmd (T.unwords $ T.pack <$> msg)
+  _ -> TIO.putStrLn "usage: specter <cmd> <message...>"
 
-agentMain msg = do
-  cfg <- (,,,,) <$> HTTP.newManager tlsManagerSettings <*> (T.pack <$> getEnv "ANTHROPIC_API_KEY")
-    <*> envT "https://api.anthropic.com/v1/messages" "API_URL"
-    <*> envT "claude-sonnet-4-20250514" "MODEL" <*> pure msg
-  term <- spawnShell (80, 24)
+agentMain cmd msg = do
+  mgr <- HTTP.newManager tlsManagerSettings
+  key <- T.pack <$> getEnv "ANTHROPIC_API_KEY"
+  term <- spawnPty' cmd (80, 24)
   TIO.putStrLn $ "=== specter ===\n" <> msg <> "\n"
   Env <$> newTVarIO term >>= \env -> newIORef (AgentSt "" "") >>=
-    async . agentLoop env cfg >> waitForProcess (_tPh term) >> TIO.putStrLn "shell exited"
-  where envT d k = maybe d T.pack <$> lookupEnv k
+    async . agentLoop env (mgr, key, msg) >> waitForProcess (_tPh term) >> TIO.putStrLn "program exited"
