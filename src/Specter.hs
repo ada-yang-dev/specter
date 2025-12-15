@@ -452,24 +452,28 @@ decodeEscapes = T.pack . go . T.unpack where
 data AgentSt = AgentSt {_stMem, _stThink :: Text}
 makeLenses ''AgentSt
 
-sysPrompt msg = T.unlines ["<system>", "You are the human at the terminal. Reason freely - we preserve your output"
-  , "in <thinking> and summarize older context into <memory> for continuity."
-  , "", "Wrap keystrokes in <emit> tags. Only the LAST <emit> is sent to the PTY:"
-  , "  <emit>ls\\r</emit>  <emit>\\x1b[A</emit> (up)  <emit>\\x03</emit> (C-c)"
-  , "", "You can change your mind - only the final <emit> executes."
-  , "</system>", "", "<message>", msg, "</message>"]
+sysPrompt msg = T.unlines ["<specter-system>"
+  , "You are using specter, a terminal emulator exposing authentic PTY interactions"
+  , "via an ANSI viewport with scrollback and escape sequence interception."
+  , "", "System tags use the specter- prefix. There is a message left for you in the"
+  , "specter-message tag. Your prior raw responses are in specter-thinking so you"
+  , "can pick up where you left off. When context grows too long, it is summarized"
+  , "into specter-memory and specter-thinking is truncated to preserve continuity."
+  , "", "End your output to send the escape sequences enclosed in the last well-formed specter-emit tag."
+  , "Examples: <specter-emit>ls\\r</specter-emit>  <specter-emit>\\x1b[A</specter-emit> (up)"
+  , "</specter-system>", "", "<specter-message>", msg, "</specter-message>"]
 
 agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
-  wrap tag t = if T.null t then "" else "<" <> tag <> ">\n" <> t <> "\n</" <> tag <> ">"
+  wrap tag t = if T.null t then "" else "<specter-" <> tag <> ">\n" <> t <> "\n</specter-" <> tag <> ">"
   buildPrompt st vp = T.unlines $ filter (not . T.null)
-    [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink, "<terminal>", vp, "</terminal>"]
+    [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink, "<specter-terminal>", vp, "</specter-terminal>"]
   api body = HTTP.parseRequest (T.unpack url) >>= \req -> HTTP.httpLbs req
     { HTTP.method = "POST", HTTP.requestBody = HTTP.RequestBodyLBS $ encode body
     , HTTP.responseTimeout = HTTP.responseTimeoutMicro 300000000
     , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01")
                             , ("content-type", "application/json")] } mgr
   ask msgs = fromMaybe "" . (decode . HTTP.responseBody >=> parseText) <$> api
-    (object ["model" .= model, "max_tokens" .= (2000::Int), "system" .= sysPrompt msg, "messages" .= msgs])
+    (object ["model" .= model, "max_tokens" .= (4000::Int), "system" .= sysPrompt msg, "messages" .= msgs])
   compact vp st = TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m" >> do
     let ctx = T.unlines ["<context>", sysPrompt msg, buildPrompt st vp, "</context>"
           , "Summarize this context into compact memory. Preserve key state and decisions."]
@@ -478,7 +482,7 @@ agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: So
           , "messages" .= [object ["role" .= ("user"::Text), "content" .= ctx]]])
     let cap = 600000 - T.length (sysPrompt msg) - T.length newMem - T.length vp
     pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 cap)
-  step = threadDelay 100000 >> readViewport env >>= \vp -> do
+  step = threadDelay 250000 >> readViewport env >>= \vp -> do
     TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
     st <- readIORef stRef
     resp <- ask [object ["role" .= ("user" :: Text), "content" .= buildPrompt st vp]]
@@ -488,8 +492,8 @@ agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: So
     writeIORef stRef =<< if T.length (st'^.stMem) + T.length (st'^.stThink) > 600000
       then compact vp st' else pure st'
 
-extractEmit = fromMaybe "" . listToMaybe . reverse . map (fst . T.breakOn "</emit>" . T.drop 6 . snd)
-  . filter (not . T.null . snd . T.breakOn "</emit>" . T.drop 6 . snd) . T.breakOnAll "<emit>"
+extractEmit = fromMaybe "" . listToMaybe . reverse . map (fst . T.breakOn "</specter-emit>" . T.drop 14 . snd)
+  . filter (not . T.null . snd . T.breakOn "</specter-emit>" . T.drop 14 . snd) . T.breakOnAll "<specter-emit>"
 
 parseText v = do
   Array arr <- parseMaybe (.: "content") v
