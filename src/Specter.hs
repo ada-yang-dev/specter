@@ -472,6 +472,7 @@ sysPrompt msg = T.unlines
   , "  keys: \\x1b[A (up)  \\x03 (ctrl-c)  \\x04 (ctrl-d)"
   , "  wait: \\x1b_wait:time:SECONDS\\x1b\\\\"
   , ""
+  , "Narration in output becomes shell input - reason in thinking, output only keystrokes."
   , "The terminal shows \\x1b[?7w when a line soft-wrapped at the margin."
   , "</system>"
   , ""
