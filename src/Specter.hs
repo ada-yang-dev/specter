@@ -8,7 +8,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
-import Control.Lens hiding ((.=), (|>))
+import Control.Lens hiding ((.=))
 import Control.Monad (forever, mfilter, unless, void, when, (>=>))
 import Data.Aeson
 import Data.Aeson.Types (parseMaybe)
@@ -21,9 +21,10 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NE
 import Data.Maybe (fromMaybe, listToMaybe, maybeToList)
-import Data.Monoid (Endo (..))
-import Data.Sequence (Seq, (|>))
+import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
+import Data.Monoid (Endo (..))
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -35,7 +36,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import System.Environment (getArgs, getEnv, getEnvironment, lookupEnv)
 import System.Posix.Pty
 import System.Process (ProcessHandle, waitForProcess)
-import Text.Read (readMaybe)
+
 import Prelude hiding (takeWhile)
 
 data Attrs = Attrs
@@ -117,7 +118,7 @@ processInputEsc input t = maybe (input, t) ((,) "" . ($ t) . scrollViewport) $ l
   , ("\ESC[1;2H", maxBound), ("\ESC[1;2~", maxBound)
   , ("\ESC[4;2~", minBound), ("\ESC[1;2F", minBound) ]
 
-renderViewport t = T.concat [renLine r | r <- [0..lastRow]] <> "\ESC[0m" where
+renderViewport t = T.concat [renLine r | r <- [0..rows-1]] <> "\ESC[0m" where
   (rows, cols, voff) = (t^.numRows, t^.numCols, t^.viewportOffset)
   (curR, curC) = (t^.cursorRow, t^.cursorCol)
   showCur = voff == 0 && t^.cursorVisible
@@ -131,17 +132,10 @@ renderViewport t = T.concat [renLine r | r <- [0..lastRow]] <> "\ESC[0m" where
   cell r c = fromMaybe (' ', blankAttrs) $ (getRow r ^. lineCells) V.!? c
   hasNL r = getRow r ^. lineHasNewline
 
-  lastCol r = max (if showCur && r == curR then curC else -1) $
-    fromMaybe (-1) $ V.findIndexR (/= (' ', blankAttrs)) (getRow r ^. lineCells)
-  lastRow = if t^.altScreenActive then rows - 1
-    else max curR $ fromMaybe 0 $ listToMaybe [r | r <- [rows-1, rows-2..0], lastCol r >= 0]
-
   withCur r c (ch, a) = if showCur && r == curR && c == curC then (ch, a & attrsInverse %~ not) else (ch, a)
 
-  renLine r
-    | t^.altScreenActive = renCells blankAttrs [cell r c | c <- [0..lastCol r]] <> "\n"
-    | otherwise = renCells blankAttrs [withCur r c (cell r c) | c <- [0..lastCol r]]
-        <> if hasNL r || lastCol r /= cols - 1 then "\n" else "\ESC[?7w"
+  renLine r = renCells blankAttrs [withCur r c (cell r c) | c <- [0..cols-1]]
+    <> if t^.altScreenActive || hasNL r then "\n" else ""
 
   renCells _ [] = ""
   renCells p ((ch, a):rest) = sgr p a <> T.singleton ch <> renCells a rest
@@ -455,95 +449,59 @@ decodeEscapes = T.pack . go . T.unpack where
 
 -- Agent
 
-data AgentSt = AgentSt {_stMem :: Text, _stThink :: Text, _stKeys :: Seq Text}
+data AgentSt = AgentSt {_stMem, _stThink :: Text}
 makeLenses ''AgentSt
 
-type Cfg = (HTTP.Manager, Text, Text, Text, Text) -- mgr, key, url, model, msg
+sysPrompt msg = T.unlines ["<system>", "You are the human at the terminal. Reason freely - we preserve your output"
+  , "in <thinking> and summarize older context into <memory> for continuity."
+  , "", "Wrap keystrokes in <emit> tags. Only the LAST <emit> is sent to the PTY:"
+  , "  <emit>ls\\r</emit>  <emit>\\x1b[A</emit> (up)  <emit>\\x03</emit> (C-c)"
+  , "", "You can change your mind - only the final <emit> executes."
+  , "</system>", "", "<message>", msg, "</message>"]
 
-sysPrompt msg = T.unlines
-  [ "<system>"
-  , "You are the human at the terminal. Your text output is typed directly into the PTY."
-  , "Thinking is private and yours - use it freely for reasoning. We preserve your"
-  , "recent thinking in <thinking> and summarize older context into <memory> so you"
-  , "can maintain continuity across our conversation."
-  , ""
-  , "Since your output goes directly to the terminal, only send what you'd type:"
-  , "  commands: ls\\r  cd src\\r  git status\\r"
-  , "  keys: \\x1b[A (up)  \\x03 (ctrl-c)  \\x04 (ctrl-d)"
-  , "  wait: \\x1b_wait:time:SECONDS\\x1b\\\\"
-  , ""
-  , "Narration in output becomes shell input - reason in thinking, output only keystrokes."
-  , "The terminal shows \\x1b[?7w when a line soft-wrapped at the margin."
-  , "</system>"
-  , ""
-  , "<message>", msg, "</message>"
-  ]
-
-agentLoop env cfg stRef = forever (step `catch` \(e :: SomeException) -> print e >> threadDelay 2000000) where
-  step = do
-    vp <- readViewport env
-    TIO.putStrLn "<<TERMINAL" >> TIO.putStrLn vp >> TIO.putStrLn "TERMINAL"
+agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
+  wrap tag t = if T.null t then "" else "<" <> tag <> ">\n" <> t <> "\n</" <> tag <> ">"
+  buildPrompt st vp = T.unlines $ filter (not . T.null)
+    [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink, "<terminal>", vp, "</terminal>"]
+  api body = HTTP.parseRequest (T.unpack url) >>= \req -> HTTP.httpLbs req
+    { HTTP.method = "POST", HTTP.requestBody = HTTP.RequestBodyLBS $ encode body
+    , HTTP.responseTimeout = HTTP.responseTimeoutMicro 300000000
+    , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01")
+                            , ("content-type", "application/json")] } mgr
+  ask msgs = fromMaybe "" . (decode . HTTP.responseBody >=> parseText) <$> api
+    (object ["model" .= model, "max_tokens" .= (2000::Int), "system" .= sysPrompt msg, "messages" .= msgs])
+  compact vp st = TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m" >> do
+    let ctx = T.unlines ["<context>", sysPrompt msg, buildPrompt st vp, "</context>"
+          , "Summarize this context into compact memory. Preserve key state and decisions."]
+    newMem <- fromMaybe (st^.stMem) . (decode . HTTP.responseBody >=> parseText)
+      <$> api (object ["model" .= model, "max_tokens" .= (4000::Int)
+          , "messages" .= [object ["role" .= ("user"::Text), "content" .= ctx]]])
+    pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 $ 400000 - T.length newMem)
+  step = threadDelay 100000 >> readViewport env >>= \vp -> do
+    TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
     st <- readIORef stRef
-    (think, keys) <- askLLM cfg [object ["role" .= ("user" :: Text), "content" .= buildPrompt st vp]]
-    unless (T.null think) $ TIO.putStrLn ("<<THINKING\n" <> think <> "\nTHINKING")
-    TIO.putStrLn $ "KEYS: " <> keys
-    let (apc, ptyKeys) = extractAPC keys
-    unless (T.null ptyKeys) $ sendKeys env ptyKeys
-    execAPC apc
-    let addThink t = if T.null think then t else t <> (if T.null t then "" else "\n\n") <> think
-        st' = st & stThink %~ addThink & stKeys %~ (\ks -> Seq.drop (max 0 $ Seq.length ks - 4) (ks |> keys))
-        ctxLen = T.length (st'^.stMem) + T.length (st'^.stThink)
-    writeIORef stRef =<< if ctxLen > 600000 then compact cfg vp st' else pure st'
+    resp <- ask [object ["role" .= ("user" :: Text), "content" .= buildPrompt st vp]]
+    TIO.putStrLn $ "--- RESPONSE ---\n" <> resp
+    unless (T.null $ extractEmit resp) $ sendKeys env (extractEmit resp)
+    let st' = st & stThink %~ (\t -> (if T.null t then "" else t <> "\n\n") <> resp)
+    writeIORef stRef =<< if T.length (st'^.stMem) + T.length (st'^.stThink) > 600000
+      then compact vp st' else pure st'
 
-buildPrompt st vp = T.unlines $ filter (not . T.null)
-  [ wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink
-  , if Seq.null (st^.stKeys) then "" else "<trace>" <> T.intercalate " | " (toList $ st^.stKeys) <> "</trace>"
-  , "<terminal>", vp, "</terminal>" ]
-  where wrap tag t = if T.null t then "" else "<" <> tag <> ">\n" <> t <> "\n</" <> tag <> ">"
+extractEmit = fromMaybe "" . listToMaybe . reverse . map (fst . T.breakOn "</emit>" . T.drop 6 . snd)
+  . filter (not . T.null . snd . T.breakOn "</emit>" . T.drop 6 . snd) . T.breakOnAll "<emit>"
 
-compact (mgr, key, url, model, msg) vp st = do
-  TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m"
-  let ctx = T.unlines ["<context>", sysPrompt msg, buildPrompt st vp, "</context>"
-        , "Summarize this context into compact memory. Preserve key state and decisions."]
-  newMem <- fromMaybe (st^.stMem) . (decode . HTTP.responseBody >=> fmap snd . parseResp)
-    <$> apiCall mgr key url (object ["model" .= model, "max_tokens" .= (4000::Int)
-        , "messages" .= [object ["role" .= ("user"::Text), "content" .= ctx]]])
-  pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 $ 400000 - T.length newMem)
-
-extractAPC t = case T.breakOn "\x1b_" t of
-  (before, rest) | not (T.null rest), (cmd, after) <- T.breakOn "\x1b\\" (T.drop 2 rest)
-    , not (T.null after) -> (Just cmd, before <> T.drop 2 after)
-  _ -> (Nothing, t)
-
-execAPC = maybe (pure ()) $ \cmd -> case T.stripPrefix "wait:time:" cmd >>= readMaybe . T.unpack of
-  Just n -> TIO.putStrLn ("\x1b[33m[wait " <> showT n <> "s]\x1b[0m") >> threadDelay (n * 1000000)
-  Nothing -> TIO.putStrLn $ "\x1b[31m[unknown: " <> cmd <> "]\x1b[0m"
-
-apiCall mgr key url body = do
-  req <- HTTP.parseRequest $ T.unpack url
-  HTTP.httpLbs req {HTTP.method = "POST", HTTP.requestBody = HTTP.RequestBodyLBS $ encode body
-    , HTTP.responseTimeout = HTTP.responseTimeoutMicro (5 * 60 * 1000000)
-    , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", "2023-06-01"), ("content-type", "application/json")]} mgr
-
-askLLM (mgr, key, url, model, msg) msgs = fromMaybe ("","") . (decode . HTTP.responseBody >=> parseResp)
-  <$> apiCall mgr key url (object ["model" .= model, "max_tokens" .= (2000::Int), "system" .= sysPrompt msg
-    , "thinking" .= object ["type" .= ("enabled"::Text), "budget_tokens" .= (1024::Int)], "messages" .= msgs])
-
-parseResp v = do
-  Object o <- pure v; Array arr <- parseMaybe (.: "content") o
-  let get typ fld = T.concat [t | Object b <- toList arr, String ty <- maybeToList (parseMaybe (.: "type") b)
-                             , ty == typ, String t <- maybeToList (parseMaybe (.: fld) b)]
-  pure (get "thinking" "thinking", T.strip $ get "text" "text")
+parseText v = do
+  Array arr <- parseMaybe (.: "content") v
+  pure $ T.strip $ T.concat [t | Object b <- toList arr, String t <- maybeToList (parseMaybe (.: "text") b)]
 
 main = getArgs >>= \case [msg] -> agentMain (T.pack msg); _ -> TIO.putStrLn "usage: specter 'message'"
 
 agentMain msg = do
-  let envT d k = maybe d T.pack <$> lookupEnv k
   cfg <- (,,,,) <$> HTTP.newManager tlsManagerSettings <*> (T.pack <$> getEnv "ANTHROPIC_API_KEY")
     <*> envT "https://api.anthropic.com/v1/messages" "API_URL"
     <*> envT "claude-sonnet-4-20250514" "MODEL" <*> pure msg
   term <- spawnShell (80, 24)
-  env <- Env <$> newTVarIO term
-  stRef <- newIORef $ AgentSt "" "" Seq.empty
   TIO.putStrLn $ "=== specter ===\n" <> msg <> "\n"
-  async (agentLoop env cfg stRef) >> waitForProcess (_tPh term) >> TIO.putStrLn "shell exited"
+  Env <$> newTVarIO term >>= \env -> newIORef (AgentSt "" "") >>=
+    async . agentLoop env cfg >> waitForProcess (_tPh term) >> TIO.putStrLn "shell exited"
+  where envT d k = maybe d T.pack <$> lookupEnv k

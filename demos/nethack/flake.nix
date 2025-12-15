@@ -13,7 +13,7 @@
       packages = forAll (pkgs: sys: {
         default = pkgs.writeShellScriptBin "specter-nethack" ''
           export PATH="${pkgs.nethack}/bin:$PATH"
-          exec ${specter.packages.${sys}.default}/bin/specter "Have fun playing NetHack! It's in your PATH."
+          exec ${specter.packages.${sys}.default}/bin/specter "Play a session of NetHack (it's in your PATH). When your adventure ends, reflect on your experience and exit the shell."
         '';
       });
 
