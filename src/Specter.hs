@@ -476,7 +476,8 @@ agentLoop env (mgr, key, url, model, msg) stRef = forever step `catch` \(_ :: So
     newMem <- fromMaybe (st^.stMem) . (decode . HTTP.responseBody >=> parseText)
       <$> api (object ["model" .= model, "max_tokens" .= (4000::Int)
           , "messages" .= [object ["role" .= ("user"::Text), "content" .= ctx]]])
-    pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 $ 400000 - T.length newMem)
+    let cap = 600000 - T.length (sysPrompt msg) - T.length newMem - T.length vp
+    pure $ st & stMem .~ newMem & stThink %~ T.takeEnd (max 0 cap)
   step = threadDelay 100000 >> readViewport env >>= \vp -> do
     TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
     st <- readIORef stRef
