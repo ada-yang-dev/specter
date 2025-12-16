@@ -7,27 +7,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: cachix/install-nix-action@v24
-
-      - name: Build
-        run: |
-          nix develop --command true
-          nix build nixpkgs#vimgolf --no-link
-
       - name: Pick challenge
-        run: |
-          CHALLENGE=$(nix run nixpkgs#vimgolf -- list | shuf -n1 | awk '{print $1}')
-          echo "challenge=$CHALLENGE" >> $GITHUB_ENV
-          nix run nixpkgs#vimgolf -- show $CHALLENGE
-
-      - name: Vim golf
-        timeout-minutes: 10
+        run: echo "ID=$(curl -s http://feeds.vimgolf.com/latest-challenges | grep -oP '9v[a-f0-9]+' | shuf -n1)" >> $GITHUB_ENV
+      - name: Golf
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          nix develop --command opencode run -m anthropic/claude-opus-4-5 "
-            Use specter to play vimgolf challenge ${{ env.challenge }}.
-            Run: nix run nixpkgs#vimgolf -- put ${{ env.challenge }}
-            Edit in vim to match the target, :wq when done. Press q to quit when prompted.
-          "
+        run: nix run .#vimgolf -- -m anthropic/claude-sonnet-4-20250514 "Play vimgolf challenge $ID"

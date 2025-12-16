@@ -29,11 +29,10 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Vector qualified as V
 import Data.Word (Word8)
-import System.Environment (getArgs, getEnvironment, lookupEnv)
+import System.Environment (getArgs, getEnvironment)
 import System.IO (hSetBuffering, stdin, stdout, BufferMode(..))
-import System.IO.Unsafe (unsafePerformIO)
+
 import System.Posix.Pty
-import System.Process (ProcessHandle)
 
 import Prelude hiding (takeWhile)
 
@@ -54,12 +53,12 @@ makeLenses ''TermLine
 newtype Lines = Lines (Seq TermLine) deriving (Show, Eq, Ord, Semigroup, Monoid)
 
 _Lines :: Iso' Lines (Seq TermLine)
-_Lines = iso (\(Lines s) -> s) Lines
+_Lines = coerced
 
-linesLen = Seq.length . (^._Lines)
-linesRep n x = x `seq` Lines (Seq.replicate n x)
+linesLen = Seq.length . view _Lines
+linesRep n = Lines . Seq.replicate n
 linesTake n = _Lines %~ Seq.take n
-linesTakeLast n (Lines s) = Lines $ Seq.drop (Seq.length s - n) s
+linesTakeLast n = _Lines %~ \s -> Seq.drop (Seq.length s - n) s
 linesDrop n = _Lines %~ Seq.drop n
 
 linesAt i = lens g s where
@@ -387,17 +386,16 @@ clearRow row c1 c2 t = t & activeScreen . linesAt row . lineCells %~
   \cs -> V.take c1 cs <> V.replicate (c2 - c1 + 1) (' ', t^.termAttrs) <> V.drop (c2 + 1) cs
 
 clamp lo hi = max lo . min hi
-between (lo, hi) x = lo <= x && x <= hi
+between (lo, hi) = (&&) <$> (lo <=) <*> (<= hi)
 
 showT :: Show a => a -> Text
 showT = T.pack . show
 
 data Terminal = Terminal
-  { _tPty :: Pty, _tPh :: ProcessHandle, _tTerm :: TVar Term
-  , _tParse :: TVar Text, _tBytes :: TVar BS.ByteString }
+  { _tPty :: Pty, _tTerm :: TVar Term, _tParse :: TVar Text, _tBytes :: TVar BS.ByteString }
 makeLenses ''Terminal
 
-newtype Env = Env (TVar Terminal)
+type Env = TVar Terminal
 
 splitUtf8 bs
   | BS.null bs || len - start >= utf8Len (BS.index bs start) = (bs, BS.empty)
@@ -411,8 +409,8 @@ splitUtf8 bs
 spawnPty' cmd (w, h) = do
   penv <- (++ [("COLUMNS", show w), ("LINES", show h), ("TERM", "xterm-256color")])
     . filter ((`notElem` ["COLUMNS","LINES","TERM"]) . fst) <$> getEnvironment
-  (pty, ph) <- spawnWithPty (Just penv) True cmd [] (w, h)
-  term <- Terminal pty ph <$> newTVarIO (mkTerm (w, h)) <*> newTVarIO "" <*> newTVarIO BS.empty
+  (pty, _) <- spawnWithPty (Just penv) True cmd [] (w, h)
+  term <- Terminal pty <$> newTVarIO (mkTerm (w, h)) <*> newTVarIO "" <*> newTVarIO BS.empty
   term <$ async (ptyReader term)
 
 ptyReader Terminal{..} = go `catch` \(_ :: SomeException) -> pure () where
@@ -431,9 +429,9 @@ runParser t = case parse parseAtom t of
   Partial k -> case k "" of Done r a -> first (a:) $ runParser r; _ -> ([], t)
   Fail{} -> ([], t)
 
-readViewport (Env tv) = renderViewport <$> (readTVarIO tv >>= readTVarIO . _tTerm)
+readViewport tv = renderViewport <$> (readTVarIO tv >>= readTVarIO . _tTerm)
 
-sendKeys (Env tv) input = readTVarIO tv >>= \term ->
+sendKeys tv input = readTVarIO tv >>= \term ->
   atomically (stateTVar (_tTerm term) (processInputEsc $ decodeEscapes input)) >>=
     \case "" -> pure (); i -> void $ writePty (_tPty term) (TE.encodeUtf8 i)
 
@@ -451,34 +449,31 @@ data Request = Request (Maybe Value) Text (Maybe Value)
 instance FromJSON Request where
   parseJSON = withObject "Request" \v -> Request <$> v .:? "id" <*> v .: "method" <*> v .:? "params"
 
-respond rid = BL.hPutStr stdout . (<> "\n") . encode . object . (["jsonrpc" .= t "2.0", "id" .= rid] ++) where t = id @Text
+respond rid = BL.hPutStr stdout . (<> "\n") . encode . object . (["jsonrpc" .= ("2.0" :: Text), "id" .= rid] ++)
 
-tools = [readTool, writeTool] where
-  readTool = object ["name" .= t "read"
-    , "description" .= t "Read the current viewport of an authentic ANSI terminal emulator."
-    , "inputSchema" .= object ["type" .= t "object", "properties" .= object []]]
-  writeTool = object ["name" .= t "write"
-    , "description" .= t "Send input to an authentic ANSI terminal emulator. Standard JSON string escapes apply (e.g., \\r for Enter, \\x1b for Escape)."
-    , "inputSchema" .= object ["type" .= t "object", "required" .= [t "input"]
-      , "properties" .= object ["input" .= object ["type" .= t "string"]]]]
-  t = id @Text
+tools = [object ["name" .= s "read", "description" .= s "Read ANSI viewport."
+           , "inputSchema" .= object ["type" .= s "object", "properties" .= object []]]
+        ,object ["name" .= s "write", "description" .= s "Write to PTY. ESC key: \\x1b"
+           , "inputSchema" .= object ["type" .= s "object", "required" .= [s "input"]
+             , "properties" .= object ["input" .= object ["type" .= s "string"]]]]]
+  where s = id @Text
 
-ok txt = ["result" .= object ["content" .= [object ["type" .= t "text", "text" .= txt]]]] where t = id @Text
+ok txt = ["result" .= object ["content" .= [object ["type" .= ("text" :: Text), "text" .= txt]]]]
 
 param :: FromJSON a => Text -> Value -> Maybe a
 param k (Object o) = parseMaybe (.: fromString (T.unpack k)) o
 param _ _ = Nothing
 
 handle _ "initialize" _ = pure ["result" .= object
-  [ "protocolVersion" .= t "2024-11-05", "capabilities" .= object ["tools" .= object []]
-  , "serverInfo" .= object ["name" .= t "specter", "version" .= t "1.0.0"]]] where t = id @Text
+  [ "protocolVersion" .= s "2024-11-05", "capabilities" .= object ["tools" .= object []]
+  , "serverInfo" .= object ["name" .= s "specter", "version" .= s "0"]]] where s = id @Text
 handle _ "notifications/initialized" _ = pure []
 handle _ "tools/list" _ = pure ["result" .= object ["tools" .= tools]]
 handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p) (fromMaybe (object []) $ param "arguments" p)
 handle _ m _ = pure ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
 
 call env "read" _ = ok <$> readViewport env
-call env "write" a = sendKeys env (fromMaybe "" $ param @Text "input" a) >> pure (ok (t "sent")) where t = id @Text
+call env "write" a = sendKeys env (fromMaybe "" $ param @Text "input" a) >> (ok <$> readViewport env)
 call _ n _ = pure ["error" .= object ["code" .= (-32602 :: Int), "message" .= ("unknown tool: " <> n)]]
 
 mcpLoop env = forever $ BL.fromStrict <$> BC.hGetLine stdin >>= dispatch . eitherDecode where
@@ -488,10 +483,6 @@ mcpLoop env = forever $ BL.fromStrict <$> BC.hGetLine stdin >>= dispatch . eithe
 
 main = do
   hSetBuffering stdin LineBuffering >> hSetBuffering stdout LineBuffering
-  args <- getArgs
-  cmd <- case args of
-    (c:_) -> pure c
-    [] -> fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
-  term <- spawnPty' cmd (80, 24)
-  mcpLoop (Env $ newTVarIO' term) `catch` \(_ :: SomeException) -> pure ()
-  where newTVarIO' = unsafePerformIO . newTVarIO
+  (cmd:_) <- getArgs
+  (spawnPty' cmd (80, 24) >>= newTVarIO >>= mcpLoop)
+    `catch` \(_ :: SomeException) -> pure ()

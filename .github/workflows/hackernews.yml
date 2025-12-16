@@ -7,20 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: cachix/install-nix-action@v24
-
-      - name: Build
-        run: |
-          nix develop --command true
-          nix build nixpkgs#lynx --no-link
-
-      - name: Browse Y Combinator News
-        timeout-minutes: 10
+      - name: Browse
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          nix develop --command opencode run -m anthropic/claude-opus-4-5 '
-            Use specter to browse Y Combinator News active discussions (nix run nixpkgs#lynx -- https://news.ycombinator.com/active).
-            Pick the most interesting story and summarize the title, link, and why it caught your attention.
-          '
+        run: nix run .#lynx -- -m anthropic/claude-sonnet-4-20250514 "Take a look at Y Combinator News on the main site and tell us what you think is interesting - you can flip through the comments. You already have lynx opened."
