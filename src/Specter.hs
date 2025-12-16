@@ -10,7 +10,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Control.Lens hiding ((.=))
 import Control.Monad (forever, mfilter, unless, void, when, (<=<))
-import Data.Bool (bool)
+
 import Data.Aeson
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
@@ -456,60 +456,101 @@ cfgThinkingBudget = 16000 :: Int
 cfgMaxTokens = 32000 :: Int
 cfgTimeout = 300000000 :: Int
 cfgPollDelay = 250000 :: Int
-cfgContextLimit = 600000 :: Int
-cfgCompactTarget = 400000 :: Int
+cfgContextLimit = 150000 :: Int  -- tokens, trigger compaction
+cfgKeepTurns = 256 :: Int        -- keep recent turns after compaction
 
-data AgentSt = AgentSt {_stMem, _stThink :: Text}
+data Turn = Turn { _turnId :: Text, _turnEmit :: Text, _turnSummary :: Text }
+data AgentSt = AgentSt { _stL2 :: Text, _stHistory :: [Turn] }
+makeLenses ''Turn
 makeLenses ''AgentSt
 
-sysPrompt msg = T.unlines ["<specter-system>"
-  , "You are using specter, a terminal emulator. The viewport below shows what a human would see."
-  , "To send input to the terminal, you MUST call the specter_emit tool. Text responses do not affect the terminal."
-  , "Your prior responses appear in specter-thinking; long context is summarized into specter-memory."
-  , "</specter-system>", "", "<specter-message>", msg, "</specter-message>"]
+mkSystem l2 = T.unlines
+  [ "You have an authentic ANSI terminal with scrollback support. You can interact with it via the specter tool. Only the latest viewport is shown with the rest replaced by your own description via the tool to save context usage. The recent turns are kept subject to truncation on compaction to improve continuity."
+  , ""
+  , "Latest context summary from compaction (if occurred): " <> l2 ]
 
-emitTool = object ["name" .= t "specter_emit", "description" .= t "Send escape sequences to the PTY"
-  , "input_schema" .= object ["type" .= t "object", "required" .= [t "keys"]
-    , "properties" .= object ["keys" .= object ["type" .= t "string"]]]] where t = id @Text
+specterTool = object ["name" .= t "specter", "description" .= t "Interact with an ANSI terminal emulator."
+  , "input_schema" .= object ["type" .= t "object", "required" .= [t "emit", t "viewport_summary"]
+    , "properties" .= object 
+      [ "emit" .= object ["type" .= t "string", "description" .= t "Escape sequences to send to PTY (examples: \\r=enter, \\x1b=escape). Empty to poll."]
+      , "viewport_summary" .= object ["type" .= t "string", "description" .= t "A description of the viewport to aid your future understanding. This replaces the viewport in tool_result history."]]]]
+  where t = id @Text
 
-agentLoop env (mgr, key, msg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
-  wrap tag = maybe "" (\t -> "<specter-" <> tag <> ">\n" <> t <> "\n</specter-" <> tag <> ">") . mfilter (not . T.null) . Just
-  prompt st vp = T.unlines $ filter (not . T.null) [wrap "memory" $ st^.stMem, wrap "thinking" $ st^.stThink
-    , "<specter-terminal>", vp, "</specter-terminal>"]
+agentLoop env (mgr, key, initialMsg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
   api = fmap (decode . HTTP.responseBody) . (HTTP.httpLbs ?? mgr) <=< mkReq . encode
   mkReq body = HTTP.parseRequest cfgApiUrl <&> \r -> r { HTTP.method = "POST"
     , HTTP.requestBody = HTTP.RequestBodyLBS body, HTTP.responseTimeout = HTTP.responseTimeoutMicro cfgTimeout
     , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", cfgApiVersion), ("content-type", "application/json")] }
-  thinking = ["thinking" .= object ["type" .= t "enabled", "budget_tokens" .= cfgThinkingBudget]] where t = id @Text
-  ask = api . object . (["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "system" .= sysPrompt msg, "tools" .= [emitTool]] ++) . (thinking ++)
-  compact vp st = TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m" >>
-    api (object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "messages" .= [object ["role" .= t "user", "content" .= ctx]]]) <&>
-    \r -> let mem' = fromMaybe (st^.stMem) (r >>= parseText)
-              fixed = T.length (sysPrompt msg) + T.length (prompt (AgentSt mem' "") vp)
-              cap = cfgCompactTarget - fixed
-          in st & stMem .~ mem' & stThink %~ T.takeEnd (max 0 cap) where
-      t = id @Text; ctx = T.unlines ["<context>", sysPrompt msg, prompt st vp, "</context>", "Summarize into compact memory."]
+
+
+  buildMsgs st vp = [userMsg] ++ concat (zipWith mkPair allTurns results) where
+    t = id @Text
+    allTurns = Turn (t "init") (t "") (t "") : reverse (st^.stHistory)
+    results = [t "[description by agent: " <> _turnSummary x <> t "]" | x <- reverse (st^.stHistory)] ++ [vp]
+    mkPair Turn{..} res =
+      [ object ["role" .= t "assistant", "content" .= [object ["type" .= t "tool_use", "id" .= _turnId
+          , "name" .= t "specter", "input" .= object ["emit" .= _turnEmit, "viewport_summary" .= _turnSummary]]]]
+      , object ["role" .= t "user", "content" .= [object ["type" .= t "tool_result"
+          , "tool_use_id" .= _turnId, "content" .= res]]] ]
+    userMsg = object ["role" .= t "user", "content" .= initialMsg]
+
+  ask st vp = api $ object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "system" .= mkSystem (st^.stL2)
+    , "tools" .= [specterTool], "messages" .= buildMsgs st vp]
+
+  compact st vp = do
+    TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m"
+    let history = T.unlines ["[description by agent: " <> _turnSummary turn <> "]" | turn <- reverse $ st^.stHistory]
+        ctx = T.unlines
+          [ "--- System ---", mkSystem (st^.stL2)
+          , "--- Initial Message ---", initialMsg
+          , "--- History ---", history
+          , "--- Viewport ---", vp ]
+        prompt = T.unlines
+          [ "Your context is being compacted. Write a helpful summary for the system prompt field:"
+          , "  \"Latest context summary from compaction (if occurred): <your summary>\""
+          , ""
+          , ctx ]
+        t = id @Text
+    r <- api $ object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens
+      , "messages" .= [object ["role" .= t "user", "content" .= prompt]]]
+    let l2' = fromMaybe (st^.stL2) (r >>= parseText)
+        keepRecent = Prelude.take cfgKeepTurns (st^.stHistory)
+    pure $ st & stL2 .~ l2' & stHistory .~ keepRecent
+
   step = threadDelay cfgPollDelay >> readViewport env >>= \vp -> do
     TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
     st <- readIORef stRef
-    (text, keys) <- fromMaybe ("", "") . (>>= parseResp) <$> ask ["messages" .= [object ["role" .= t "user", "content" .= prompt st vp]]]
-    TIO.putStrLn $ "--- RESPONSE ---\n" <> text
-    unless (T.null keys) $ sendKeys env keys
-    let st' = st & stThink %~ (<> (if T.null (st^.stThink) then "" else "\n\n") <> text)
-    writeIORef stRef =<< bool (pure st') (compact vp st') (T.length (sysPrompt msg) + T.length (prompt st' vp) > cfgContextLimit)
-    where t = id @Text
+    resp <- ask st vp
+    let inputTokens = fromMaybe 0 (resp >>= parseUsage)
+    case resp >>= parseResp of
+      Just (txt, Just (tid, emit, summ)) -> do
+        unless (T.null txt) $ TIO.putStrLn $ "--- Response ---\n" <> txt
+        TIO.putStrLn $ "--- emit: " <> emit <> " | tokens: " <> showT inputTokens <> " ---"
+        unless (T.null emit) $ sendKeys env emit
+        let st' = st & stHistory %~ (Turn tid emit summ :)
+        writeIORef stRef =<< if inputTokens > cfgContextLimit then compact st' vp else pure st'
+      _ -> TIO.putStrLn $ "--- NO ACTION | tokens: " <> showT inputTokens <> " ---\n" <> maybe "(no response)" showT resp
 
 parseResp v = do
   Array arr <- parseMaybe (.: "content") v
   let blocks = toList arr
-  pure ( T.strip $ T.concat [t | Object b <- blocks, String t <- maybeToList $ parseMaybe (.: "text") b]
-       , T.concat [k | Object b <- blocks, String "tool_use" <- maybeToList (parseMaybe (.: "type") b)
-           , String "specter_emit" <- maybeToList (parseMaybe (.: "name") b)
-           , Object inp <- maybeToList (parseMaybe (.: "input") b), String k <- maybeToList (parseMaybe (.: "keys") inp)])
+      txt = T.strip $ T.concat [x | Object b <- blocks, String x <- maybeToList $ parseMaybe (.: "text") b]
+      tools = [(tid, em, su) | Object b <- blocks, String "tool_use" <- maybeToList (parseMaybe (.: "type") b)
+        , String "specter" <- maybeToList (parseMaybe (.: "name") b)
+        , String tid <- maybeToList (parseMaybe (.: "id") b)
+        , Object inp <- maybeToList (parseMaybe (.: "input") b)
+        , String em <- maybeToList (parseMaybe (.: "emit") inp)
+        , String su <- maybeToList (parseMaybe (.: "viewport_summary") inp)]
+  pure (txt, listToMaybe tools)
+
+parseUsage v = do
+  Object u <- parseMaybe (.: "usage") v
+  n <- parseMaybe (.: "input_tokens") u
+  pure (n :: Int)
 
 parseText v = do
   Array arr <- parseMaybe (.: "content") v
-  pure $ T.strip $ T.concat [t | Object b <- toList arr, String t <- maybeToList $ parseMaybe (.: "text") b]
+  pure $ T.strip $ T.concat [x | Object b <- toList arr, String x <- maybeToList $ parseMaybe (.: "text") b]
 
 main = getArgs >>= \case
   cmd : msg -> agentMain cmd (T.unwords $ T.pack <$> msg)
@@ -520,5 +561,5 @@ agentMain cmd msg = do
   key <- T.pack <$> getEnv "ANTHROPIC_API_KEY"
   term <- spawnPty' cmd (80, 24)
   TIO.putStrLn $ "=== specter ===\n" <> msg <> "\n"
-  Env <$> newTVarIO term >>= \env -> newIORef (AgentSt "" "") >>=
+  Env <$> newTVarIO term >>= \env -> newIORef (AgentSt "" []) >>=
     async . agentLoop env (mgr, key, msg) >> waitForProcess (_tPh term) >> TIO.putStrLn "program exited"
