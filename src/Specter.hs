@@ -4,39 +4,36 @@ module Main where
 
 import Control.Applicative ((<|>))
 import Control.Arrow (first, (>>>))
-import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Control.Lens hiding ((.=))
-import Control.Monad (forever, mfilter, unless, void, when, (<=<))
-
+import Control.Monad (forever, mfilter, void, when)
 import Data.Aeson
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
 import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BC
+import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.Char (chr, digitToInt, isDigit, isHexDigit)
-import Data.Foldable (toList)
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NE
-import Data.Maybe (fromMaybe, listToMaybe, maybeToList)
+import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Monoid (Endo (..))
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
-import Data.Monoid (Endo (..))
-
+import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
 import Data.Word (Word8)
-import Network.HTTP.Client qualified as HTTP
-import Network.HTTP.Client.TLS (tlsManagerSettings)
-import System.Environment (getArgs, getEnv, getEnvironment)
+import System.Environment (getArgs, getEnvironment, lookupEnv)
+import System.IO (hSetBuffering, stdin, stdout, BufferMode(..))
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Pty
-import System.Process (ProcessHandle, waitForProcess)
+import System.Process (ProcessHandle)
 
 import Prelude hiding (takeWhile)
 
@@ -447,119 +444,54 @@ decodeEscapes = T.pack . go . T.unpack where
     '\\':'x':a:b:r | all isHexDigit [a,b] -> chr (digitToInt a * 16 + digitToInt b) : go r
     c:r -> c : go r; [] -> []
 
--- Agent
+-- MCP Server (stdio, JSON-RPC 2.0)
 
-cfgModel = "claude-sonnet-4-20250514" :: Text
-cfgApiUrl = "https://api.anthropic.com/v1/messages" :: String
-cfgApiVersion = "2023-06-01" :: BS.ByteString
-cfgThinkingBudget = 16000 :: Int
-cfgMaxTokens = 32000 :: Int
-cfgTimeout = 300000000 :: Int
-cfgPollDelay = 250000 :: Int
-cfgContextLimit = 150000 :: Int  -- tokens, trigger compaction
-cfgKeepTurns = 256 :: Int        -- keep recent turns after compaction
+data Request = Request (Maybe Value) Text (Maybe Value)
 
-data Turn = Turn { _turnId :: Text, _turnEmit :: Text, _turnSummary :: Text }
-data AgentSt = AgentSt { _stL2 :: Text, _stHistory :: [Turn] }
-makeLenses ''Turn
-makeLenses ''AgentSt
+instance FromJSON Request where
+  parseJSON = withObject "Request" \v -> Request <$> v .:? "id" <*> v .: "method" <*> v .:? "params"
 
-mkSystem l2 = T.unlines
-  [ "You have an authentic ANSI terminal with scrollback support. You can interact with it via the specter tool. Only the latest viewport is shown with the rest replaced by your own description via the tool to save context usage. The recent turns are kept subject to truncation on compaction to improve continuity."
-  , ""
-  , "Latest context summary from compaction (if occurred): " <> l2 ]
+respond rid = BL.hPutStr stdout . (<> "\n") . encode . object . (["jsonrpc" .= t "2.0", "id" .= rid] ++) where t = id @Text
 
-specterTool = object ["name" .= t "specter", "description" .= t "Interact with an ANSI terminal emulator."
-  , "input_schema" .= object ["type" .= t "object", "required" .= [t "emit", t "viewport_summary"]
-    , "properties" .= object 
-      [ "emit" .= object ["type" .= t "string", "description" .= t "Escape sequences to send to PTY (examples: \\r=enter, \\x1b=escape). Empty to poll."]
-      , "viewport_summary" .= object ["type" .= t "string", "description" .= t "A description of the viewport to aid your future understanding. This replaces the viewport in tool_result history."]]]]
-  where t = id @Text
+tools = [readTool, writeTool] where
+  readTool = object ["name" .= t "read"
+    , "description" .= t "Read the current viewport of an authentic ANSI terminal emulator."
+    , "inputSchema" .= object ["type" .= t "object", "properties" .= object []]]
+  writeTool = object ["name" .= t "write"
+    , "description" .= t "Send input to an authentic ANSI terminal emulator. Standard JSON string escapes apply (e.g., \\r for Enter, \\x1b for Escape)."
+    , "inputSchema" .= object ["type" .= t "object", "required" .= [t "input"]
+      , "properties" .= object ["input" .= object ["type" .= t "string"]]]]
+  t = id @Text
 
-agentLoop env (mgr, key, initialMsg) stRef = forever step `catch` \(_ :: SomeException) -> pure () where
-  api = fmap (decode . HTTP.responseBody) . (HTTP.httpLbs ?? mgr) <=< mkReq . encode
-  mkReq body = HTTP.parseRequest cfgApiUrl <&> \r -> r { HTTP.method = "POST"
-    , HTTP.requestBody = HTTP.RequestBodyLBS body, HTTP.responseTimeout = HTTP.responseTimeoutMicro cfgTimeout
-    , HTTP.requestHeaders = [("x-api-key", TE.encodeUtf8 key), ("anthropic-version", cfgApiVersion), ("content-type", "application/json")] }
+ok txt = ["result" .= object ["content" .= [object ["type" .= t "text", "text" .= txt]]]] where t = id @Text
 
+param :: FromJSON a => Text -> Value -> Maybe a
+param k (Object o) = parseMaybe (.: fromString (T.unpack k)) o
+param _ _ = Nothing
 
-  buildMsgs st vp = [userMsg] ++ concat (zipWith mkPair allTurns results) where
-    t = id @Text
-    allTurns = Turn (t "init") (t "") (t "") : reverse (st^.stHistory)
-    results = [t "[description by agent: " <> _turnSummary x <> t "]" | x <- reverse (st^.stHistory)] ++ [vp]
-    mkPair Turn{..} res =
-      [ object ["role" .= t "assistant", "content" .= [object ["type" .= t "tool_use", "id" .= _turnId
-          , "name" .= t "specter", "input" .= object ["emit" .= _turnEmit, "viewport_summary" .= _turnSummary]]]]
-      , object ["role" .= t "user", "content" .= [object ["type" .= t "tool_result"
-          , "tool_use_id" .= _turnId, "content" .= res]]] ]
-    userMsg = object ["role" .= t "user", "content" .= initialMsg]
+handle _ "initialize" _ = pure ["result" .= object
+  [ "protocolVersion" .= t "2024-11-05", "capabilities" .= object ["tools" .= object []]
+  , "serverInfo" .= object ["name" .= t "specter", "version" .= t "1.0.0"]]] where t = id @Text
+handle _ "notifications/initialized" _ = pure []
+handle _ "tools/list" _ = pure ["result" .= object ["tools" .= tools]]
+handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p) (fromMaybe (object []) $ param "arguments" p)
+handle _ m _ = pure ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
 
-  ask st vp = api $ object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens, "system" .= mkSystem (st^.stL2)
-    , "tools" .= [specterTool], "messages" .= buildMsgs st vp]
+call env "read" _ = ok <$> readViewport env
+call env "write" a = sendKeys env (fromMaybe "" $ param @Text "input" a) >> pure (ok (t "sent")) where t = id @Text
+call _ n _ = pure ["error" .= object ["code" .= (-32602 :: Int), "message" .= ("unknown tool: " <> n)]]
 
-  compact st vp = do
-    TIO.putStrLn "\x1b[33m[compacting...]\x1b[0m"
-    let history = T.unlines ["[description by agent: " <> _turnSummary turn <> "]" | turn <- reverse $ st^.stHistory]
-        ctx = T.unlines
-          [ "--- System ---", mkSystem (st^.stL2)
-          , "--- Initial Message ---", initialMsg
-          , "--- History ---", history
-          , "--- Viewport ---", vp ]
-        prompt = T.unlines
-          [ "Your context is being compacted. Write a helpful summary for the system prompt field:"
-          , "  \"Latest context summary from compaction (if occurred): <your summary>\""
-          , ""
-          , ctx ]
-        t = id @Text
-    r <- api $ object ["model" .= cfgModel, "max_tokens" .= cfgMaxTokens
-      , "messages" .= [object ["role" .= t "user", "content" .= prompt]]]
-    let l2' = fromMaybe (st^.stL2) (r >>= parseText)
-        keepRecent = Prelude.take cfgKeepTurns (st^.stHistory)
-    pure $ st & stL2 .~ l2' & stHistory .~ keepRecent
+mcpLoop env = forever $ BL.fromStrict <$> BC.hGetLine stdin >>= dispatch . eitherDecode where
+  dispatch (Left e) = respond Null ["error" .= object ["code" .= (-32700 :: Int), "message" .= e]]
+  dispatch (Right (Request Nothing _ _)) = pure ()
+  dispatch (Right (Request (Just rid) method params)) = handle env method params >>= respond rid
 
-  step = threadDelay cfgPollDelay >> readViewport env >>= \vp -> do
-    TIO.putStrLn "--- TERMINAL ---" >> TIO.putStrLn vp
-    st <- readIORef stRef
-    resp <- ask st vp
-    let inputTokens = fromMaybe 0 (resp >>= parseUsage)
-    case resp >>= parseResp of
-      Just (txt, Just (tid, emit, summ)) -> do
-        unless (T.null txt) $ TIO.putStrLn $ "--- Response ---\n" <> txt
-        TIO.putStrLn $ "--- emit: " <> emit <> " | tokens: " <> showT inputTokens <> " ---"
-        unless (T.null emit) $ sendKeys env emit
-        let st' = st & stHistory %~ (Turn tid emit summ :)
-        writeIORef stRef =<< if inputTokens > cfgContextLimit then compact st' vp else pure st'
-      _ -> TIO.putStrLn $ "--- NO ACTION | tokens: " <> showT inputTokens <> " ---\n" <> maybe "(no response)" showT resp
-
-parseResp v = do
-  Array arr <- parseMaybe (.: "content") v
-  let blocks = toList arr
-      txt = T.strip $ T.concat [x | Object b <- blocks, String x <- maybeToList $ parseMaybe (.: "text") b]
-      tools = [(tid, em, su) | Object b <- blocks, String "tool_use" <- maybeToList (parseMaybe (.: "type") b)
-        , String "specter" <- maybeToList (parseMaybe (.: "name") b)
-        , String tid <- maybeToList (parseMaybe (.: "id") b)
-        , Object inp <- maybeToList (parseMaybe (.: "input") b)
-        , String em <- maybeToList (parseMaybe (.: "emit") inp)
-        , String su <- maybeToList (parseMaybe (.: "viewport_summary") inp)]
-  pure (txt, listToMaybe tools)
-
-parseUsage v = do
-  Object u <- parseMaybe (.: "usage") v
-  n <- parseMaybe (.: "input_tokens") u
-  pure (n :: Int)
-
-parseText v = do
-  Array arr <- parseMaybe (.: "content") v
-  pure $ T.strip $ T.concat [x | Object b <- toList arr, String x <- maybeToList $ parseMaybe (.: "text") b]
-
-main = getArgs >>= \case
-  cmd : msg -> agentMain cmd (T.unwords $ T.pack <$> msg)
-  _ -> TIO.putStrLn "usage: specter <cmd> <message...>"
-
-agentMain cmd msg = do
-  mgr <- HTTP.newManager tlsManagerSettings
-  key <- T.pack <$> getEnv "ANTHROPIC_API_KEY"
+main = do
+  hSetBuffering stdin LineBuffering >> hSetBuffering stdout LineBuffering
+  args <- getArgs
+  cmd <- case args of
+    (c:_) -> pure c
+    [] -> fromMaybe "/bin/sh" <$> lookupEnv "SHELL"
   term <- spawnPty' cmd (80, 24)
-  TIO.putStrLn $ "=== specter ===\n" <> msg <> "\n"
-  Env <$> newTVarIO term >>= \env -> newIORef (AgentSt "" []) >>=
-    async . agentLoop env (mgr, key, msg) >> waitForProcess (_tPh term) >> TIO.putStrLn "program exited"
+  mcpLoop (Env $ newTVarIO' term) `catch` \(_ :: SomeException) -> pure ()
+  where newTVarIO' = unsafePerformIO . newTVarIO

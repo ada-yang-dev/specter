@@ -16,9 +16,44 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1765772535,
+        "narHash": "sha256-aq+dQoaPONOSjtFIBnAXseDm9TUhIbe215TPmkfMYww=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "09b8fda8959d761445f12b55f380d90375a1d6bb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "opencode": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2"
+      },
+      "locked": {
+        "lastModified": 1765859625,
+        "narHash": "sha256-A+3laoLpJvCD8+51XfB9ygWjwx7pUxcRvrTHzCPyX90=",
+        "owner": "ada-yang-dev",
+        "repo": "opencode",
+        "rev": "27ec169c450f991d10fae7ec457807c163fc0b50",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ada-yang-dev",
+        "repo": "opencode",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "opencode": "opencode"
       }
     }
   },

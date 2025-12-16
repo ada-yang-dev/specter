@@ -1,8 +1,11 @@
 {
   description = "Authentic terminal primitives enabling autonomous agents to operate interactive applications.";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    opencode.url = "github:ada-yang-dev/opencode";
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, opencode }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (s: f (import nixpkgs {
@@ -10,25 +13,43 @@
         config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "specter";
       }));
     in {
-      packages = forAll (pkgs: let sys = pkgs.stdenv.hostPlatform.system; specter = pkgs.haskell.lib.overrideCabal
-          (pkgs.haskellPackages.callCabal2nix "specter" ./. {}) (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; }); in {
-        default = specter;
-        nethack = pkgs.writeShellScriptBin "specter-nethack" ''
-          exec ${specter}/bin/specter ${pkgs.nethack}/bin/nethack "Play NetHack. You're seeing an authentic terminal - the same view a human would see. The @ is you. Top line shows messages (read them!), bottom two lines show your stats. Take your time, stay alive, descend when ready. Have fun exploring."
+      packages = forAll (pkgs: let 
+        sys = pkgs.stdenv.hostPlatform.system;
+        specter = pkgs.haskell.lib.overrideCabal
+          (pkgs.haskellPackages.callCabal2nix "specter" ./. {}) (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; });
+        oc = opencode.packages.${sys}.default;
+      in {
+        default = pkgs.writeShellScriptBin "specter" ''
+          dir=$(mktemp -d)
+          cat > "$dir/opencode.json" <<CONF
+          {
+            "mcp":{"specter":{"type":"local","command":["${specter}/bin/specter"]}},
+            "permission":{"edit":"allow","bash":{"*":"allow"},"mcp":{"*":"allow"}}
+          }
+          CONF
+          cd "$dir" && exec ${oc}/bin/opencode "$@"
         '';
-      });
-
-      apps = forAll (pkgs: let sys = pkgs.stdenv.hostPlatform.system; in {
-        nethack = { type = "app"; program = "${self.packages.${sys}.nethack}/bin/specter-nethack"; };
+        nethack = pkgs.writeShellScriptBin "specter-nethack" ''
+          dir=$(mktemp -d)
+          cat > "$dir/opencode.json" <<CONF
+          {
+            "mcp":{"specter":{"type":"local","command":["${specter}/bin/specter","${pkgs.nethack}/bin/nethack"]}},
+            "tools":{"*":false,"specter_read":true,"specter_write":true}
+          }
+          CONF
+          cd "$dir" && exec ${oc}/bin/opencode "$@"
+        '';
+        mcp = specter;
+        opencode = oc;
       });
 
       devShells = forAll (pkgs: let sys = pkgs.stdenv.hostPlatform.system; in {
         default = pkgs.haskellPackages.shellFor {
-          packages = _: [ self.packages.${sys}.default ];
-          buildInputs = [ pkgs.cabal-install pkgs.opencode ];
+          packages = _: [ self.packages.${sys}.mcp ];
+          buildInputs = [ pkgs.cabal-install self.packages.${sys}.opencode ];
           shellHook = ''
-            [ -f specter.cabal ] && cat > opencode.json <<EOF
-            {"mcp":{"specter":{"type":"local","command":["${self.packages.${sys}.default}/bin/specter"]}}}
+            cat > opencode.json <<EOF
+            {"mcp":{"specter":{"type":"local","command":["${self.packages.${sys}.mcp}/bin/specter"]}}}
             EOF
           '';
         };

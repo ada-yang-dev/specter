@@ -18,16 +18,11 @@ executable specter
     , base
     , bytestring
     , containers
-    , directory
-    , http-client
-    , http-client-tls
     , lens
-    , network
     , posix-pty
     , process
     , stm
     , text
-    , unix
     , vector
 
 
