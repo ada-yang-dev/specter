@@ -234,7 +234,7 @@ privCsi _ _ = Nothing
 parseOsc = do
   s <- T.take 66 <$> takeTill (< ' ')
   _ <- option ' ' (char '\a' <|> (string "\ESC\\" >> pure ' '))
-  pure $ AUnk $ "\ESC]" <> s  -- ignore OSC (window title, etc)
+  pure $ AUnk $ "\ESC]" <> s
 
 parseSGR = \case
   [] -> [SReset]
@@ -441,8 +441,6 @@ decodeEscapes = T.pack . go . T.unpack where
     '\\':'\\':r -> '\\' : go r
     '\\':'x':a:b:r | all isHexDigit [a,b] -> chr (digitToInt a * 16 + digitToInt b) : go r
     c:r -> c : go r; [] -> []
-
--- MCP Server (stdio, JSON-RPC 2.0)
 
 data Request = Request (Maybe Value) Text (Maybe Value)
 
