@@ -12,4 +12,4 @@ jobs:
       - name: Browse
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#lynx -- -m anthropic/claude-opus-4-20250514 "Conduct ethnographic research on the technology community at Y Combinator News by perusing the comments. Briefly report what you observe. Lynx is already open."
+        run: nix run .#lynx -- -m anthropic/claude-sonnet-4-20250514 "Conduct ethnographic research on the technology community at Y Combinator News by perusing the comments. Briefly report what you observe. Lynx is already open."

@@ -1,0 +1,1 @@
+Specific terminal emulation implementation inspired by [hs-term-emulator](https://hackage.haskell.org/package/hs-term-emulator-0.1.0.4); source code: https://github.com/bitc/hs-term-emulator/commit/76060b1cd4e9e7b3841b1ca22b34c550108758d6

@@ -13,4 +13,4 @@ jobs:
       - name: Play
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#nethack -- -m anthropic/claude-opus-4-20250514 "NetHack is already open via specter. Play until you die (or ascend!) autonomously without responding. Tell us about your experience only after the journey has ended. Have fun!"
+        run: nix run .#nethack -- -m anthropic/claude-sonnet-4-20250514 "NetHack is already open via specter. Keep calling specter tools to play until you die (or ascend!). You may narrate your thinking, but don't wait for user input. Report your experience after the journey ends. Have fun!"
