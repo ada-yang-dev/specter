@@ -14,4 +14,4 @@ jobs:
       - name: Golf
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#vimgolf -- -m anthropic/claude-opus-4-20250514 "Play vimgolf challenge $ID"
+        run: nix run .#vimgolf -- -m anthropic/claude-opus-4-20250514 "Solve vimgolf challenge ID $ID. You have a bash shell via specter with vimgolf and vim on the PATH. Solve it autonomously without asking for input from the user."
