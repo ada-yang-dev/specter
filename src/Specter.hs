@@ -451,9 +451,9 @@ respond rid = BL.hPutStr stdout . (<> "\n") . encode . object . (["jsonrpc" .= (
 
 tools = [object ["name" .= s "read", "description" .= s "Read ANSI viewport."
            , "inputSchema" .= object ["type" .= s "object", "properties" .= object []]]
-        ,object ["name" .= s "write", "description" .= s "Write to PTY. ESC key: \\x1b"
-           , "inputSchema" .= object ["type" .= s "object", "required" .= [s "input"]
-             , "properties" .= object ["input" .= object ["type" .= s "string"]]]]]
+        ,object ["name" .= s "write", "description" .= s "Write to PTY. Examples: \\r (enter), \\x1b (esc), \\x03 (^C)"
+           , "inputSchema" .= object ["type" .= s "object", "required" .= [s "emit"]
+             , "properties" .= object ["emit" .= object ["type" .= s "string"]]]]]
   where s = id @Text
 
 ok txt = ["result" .= object ["content" .= [object ["type" .= ("text" :: Text), "text" .= txt]]]]
@@ -471,7 +471,7 @@ handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p
 handle _ m _ = pure ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
 
 call env "read" _ = ok <$> readViewport env
-call env "write" a = sendKeys env (fromMaybe "" $ param @Text "input" a) >> (ok <$> readViewport env)
+call env "write" a = sendKeys env (fromMaybe "" $ param @Text "emit" a) >> (ok <$> readViewport env)
 call _ n _ = pure ["error" .= object ["code" .= (-32602 :: Int), "message" .= ("unknown tool: " <> n)]]
 
 mcpLoop env = forever $ BL.fromStrict <$> BC.hGetLine stdin >>= dispatch . eitherDecode where

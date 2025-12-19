@@ -13,4 +13,4 @@ jobs:
       - name: Play
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#nethack -- -m anthropic/claude-sonnet-4-20250514 "Have fun playing NetHack!"
+        run: nix run .#nethack -- -m anthropic/claude-opus-4-20250514 "Play a session of NetHack. Tell us about your experience when your adventure ends. Have fun!"
