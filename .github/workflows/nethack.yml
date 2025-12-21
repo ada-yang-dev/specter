@@ -13,4 +13,4 @@ jobs:
       - name: Play
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#nethack -- -m anthropic/claude-opus-4-5 "Have fun playing NetHack! Push the envelope - see how far you can go. This is an autonomous session. Keep using specter to play. Yielding would inadvertently end the session."
+        run: nix run .#nethack -- -m anthropic/claude-opus-4-5 "Have fun playing NetHack! Push the envelope - see how far you can go. This is an autonomous session; it is critical that you do not ask for user feedback, as doing so would terminate the session inadvertently. Report back only after your character has died or ascended. Keep calling specter to maintain the session without human intervention."

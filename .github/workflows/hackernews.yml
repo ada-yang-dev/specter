@@ -12,4 +12,4 @@ jobs:
       - name: Browse
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#lynx -- -m anthropic/claude-sonnet-4-5 "Conduct ethnographic research on https://news.ycombinator.com/active using lynx. Share your observations."
+        run: nix run .#lynx -- -m anthropic/claude-opus-4-5 "Conduct ethnographic research on https://news.ycombinator.com/active using lynx. Share your observations."

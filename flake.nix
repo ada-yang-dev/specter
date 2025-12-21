@@ -18,21 +18,13 @@
           name = "opencode";
           runtimeInputs = [ pkgs.opencode pkgs.jq ];
           text = ''
+            nl=
             ${pkgs.opencode}/bin/opencode run --format json "$@" | while IFS= read -r line; do
-              type=$(jq -r '.type' <<< "$line")
-              case "$type" in
-                text)
-                  jq -r '.part.text' <<< "$line"
-                  ;;
+              case $(jq -r '.type' <<< "$line") in
+                text) jq -rj '.part.text' <<< "$line"; nl=1 ;;
                 tool_use)
-                  tool=$(jq -r '.part.tool' <<< "$line")
-                  args=$(jq -r '.part.state.input | if . == {} then "" else tostring end' <<< "$line")
-                  if [[ -n "$args" ]]; then
-                    printf '\e[48;5;229;30m %s: %s \e[0m\n' "$tool" "$args"
-                  else
-                    printf '\e[48;5;229;30m %s \e[0m\n' "$tool"
-                  fi
-                  printf '%s\n' "$(jq -r '.part.state.output // empty' <<< "$line")"
+                  [[ $nl ]] && echo; nl=
+                  jq -r '"\u001b[38;5;205m\(.part.tool)\(if .part.state.input == {} then "" else ": \(.part.state.input)" end)\u001b[0m\(.part.state.output // "" | if startswith("\n") or . == "" then . else "\n\(.)" end)"' <<< "$line"
                   ;;
               esac
             done
