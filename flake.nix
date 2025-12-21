@@ -10,8 +10,7 @@
         config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "specter";
       }));
     in {
-      packages = forAll (pkgs: let 
-        sys = pkgs.stdenv.hostPlatform.system;
+      packages = forAll (pkgs: let
         specter = pkgs.haskell.lib.overrideCabal
           (pkgs.haskellPackages.callCabal2nix "specter" ./. {}) (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; });
         opencode = pkgs.writeShellApplication {
@@ -32,13 +31,13 @@
         };
         mkSpecter = name: packages: let
           shell = pkgs.writeShellScript "${name}-shell" ''
-            export PATH="${pkgs.lib.makeBinPath packages}:$PATH"
+            export PATH="${pkgs.lib.makeBinPath (packages ++ [ pkgs.coreutils ])}"
             exec ${pkgs.fish}/bin/fish
           '';
         in pkgs.writeShellScriptBin "specter-${name}" ''
-          dir=$(mktemp -d)
+          dir=$(${pkgs.coreutils}/bin/mktemp -d)
           export HOME="$dir" XDG_CONFIG_HOME="$dir"
-          cat > "$dir/opencode.json" <<CONF
+          ${pkgs.coreutils}/bin/cat > "$dir/opencode.json" <<CONF
           {"provider":{"anthropic":{"models":{"claude-opus-4-5":{"options":{"thinking":{"type":"enabled","budgetTokens":16000}}}}}},"mcp":{"specter":{"type":"local","command":["${specter}/bin/specter","${shell}"]}},"tools":{"*":false,"specter_read":true,"specter_write":true}}
           CONF
           cd "$dir" && exec ${opencode}/bin/opencode "$@"
