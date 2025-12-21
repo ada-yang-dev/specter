@@ -33,7 +33,7 @@
         mkSpecter = name: packages: let
           shell = pkgs.writeShellScript "${name}-shell" ''
             export PATH="${pkgs.lib.makeBinPath packages}:$PATH"
-            exec ${pkgs.bash}/bin/bash
+            exec ${pkgs.fish}/bin/fish
           '';
         in pkgs.writeShellScriptBin "specter-${name}" ''
           dir=$(mktemp -d)
