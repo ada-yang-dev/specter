@@ -3,16 +3,17 @@
 module Main where
 
 import Control.Applicative ((<|>))
-import Control.Arrow (first, (>>>))
+import Control.Arrow (first, second, (>>>))
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Control.Lens hiding ((.=))
-import Control.Monad (forever, mfilter, void, when)
+import Control.Monad (forever, mfilter, void, when, (<=<))
 import Data.Aeson
 import Data.Aeson.Types (parseMaybe)
 import Data.Attoparsec.Text hiding (try)
 import Data.Bits ((.&.))
+import Data.Bool (bool)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy.Char8 qualified as BL
@@ -27,14 +28,13 @@ import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Tuple (swap)
 import Data.Vector qualified as V
 import Data.Word (Word8)
-import System.Environment (getArgs, getEnvironment)
-import System.IO (hSetBuffering, stdin, stdout, BufferMode(..))
-
-import System.Posix.Pty
-
 import Prelude hiding (takeWhile)
+import System.Environment (getArgs, getEnvironment)
+import System.IO (BufferMode(..), hSetBuffering, stdin, stdout)
+import System.Posix.Pty
 
 data Attrs = Attrs
   { _attrsFg, _attrsBg, _attrsIntensity, _attrsUnderline :: !Word8
@@ -56,10 +56,10 @@ _Lines :: Iso' Lines (Seq TermLine)
 _Lines = coerced
 
 linesLen = Seq.length . view _Lines
-linesRep n = Lines . Seq.replicate n
-linesTake n = _Lines %~ Seq.take n
-linesTakeLast n = _Lines %~ \s -> Seq.drop (Seq.length s - n) s
-linesDrop n = _Lines %~ Seq.drop n
+linesRep = (Lines .) . Seq.replicate
+linesTake = over _Lines . Seq.take
+linesTakeLast n = _Lines %~ liftA2 Seq.drop (subtract n . Seq.length) id
+linesDrop = over _Lines . Seq.drop
 
 linesAt i = lens g s where
   cl x = max 0 $ min (Seq.length x - 1) i
@@ -93,19 +93,19 @@ mkTerm (w, h) = Term blankAttrs 0 0 (CursorState False False) (SavedCursor 0 0 b
 
 activeScreen :: Lens' Term Lines
 activeScreen = lens g s where
-  g t = t ^. if t^.altScreenActive then termAlt else termScreen
-  s t v = t & (if t^.altScreenActive then termAlt else termScreen) .~ v
+  g t = t ^. bool termScreen termAlt (t^.altScreenActive)
+  s t = set (bool termScreen termAlt (t^.altScreenActive)) ?? t
 
 cursorLine :: Lens' Term TermLine
 cursorLine = lens g s where
   g t = t ^. activeScreen . linesAt (t^.cursorRow)
-  s t v = t & activeScreen . linesAt (t^.cursorRow) .~ v
+  s t = set (activeScreen . linesAt (t^.cursorRow)) ?? t
 
 cursorLineCells = cursorLine . lineCells
 
 vAt i = lens (\v -> v V.! cl v) (\v x -> v V.// [(cl v, x)]) where cl v = clamp 0 (V.length v - 1) i
 
-addScrollBack f = scrollBackLines %~ (linesTakeLast 1000 . f)
+addScrollBack = over scrollBackLines . (linesTakeLast 1024 .)
 scrollViewport d t = t & viewportOffset %~ (max 0 . min (linesLen $ t^.scrollBackLines) . (+ d))
 
 processInputEsc input t = maybe (input, t) ((,) "" . ($ t) . scrollViewport) $ lookup input
@@ -117,38 +117,31 @@ processInputEsc input t = maybe (input, t) ((,) "" . ($ t) . scrollViewport) $ l
 
 renderViewport t = T.concat [renLine r | r <- [0..rows-1]] <> "\ESC[0m" where
   (rows, cols, voff) = (t^.numRows, t^.numCols, t^.viewportOffset)
-  (curR, curC) = (t^.cursorRow, t^.cursorCol)
-  showCur = voff == 0 && t^.cursorVisible
-  (scr, sb) = (t^.activeScreen, t^.scrollBackLines)
-  (sbLen, sbSeq) = (linesLen sb, sb^._Lines)
+  (curR, curC, showCur) = (t^.cursorRow, t^.cursorCol, voff == 0 && t^.cursorVisible)
+  (scr, sb, sbLen, sbSeq) = (t^.activeScreen, t^.scrollBackLines, linesLen sb, sb^._Lines)
 
   getRow r = let v = sbLen - voff + r in if
-    | v < 0 -> blankLine cols
-    | v < sbLen -> Seq.index sbSeq v
-    | otherwise -> scr ^. linesAt (v - sbLen)
+    | v < 0 -> blankLine cols | v < sbLen -> Seq.index sbSeq v | otherwise -> scr ^. linesAt (v - sbLen)
   cell r c = fromMaybe (' ', blankAttrs) $ (getRow r ^. lineCells) V.!? c
-  hasNL r = getRow r ^. lineHasNewline
-
-  withCur r c (ch, a) = if showCur && r == curR && c == curC then (ch, a & attrsInverse %~ not) else (ch, a)
-
+  withCur r c (ch, a) = bool id (second $ attrsInverse %~ not) (showCur && r == curR && c == curC) (ch, a)
   renLine r = renCells blankAttrs [withCur r c (cell r c) | c <- [0..cols-1]]
-    <> if t^.altScreenActive || hasNL r then "\n" else ""
+    <> bool "" "\n" (t^.altScreenActive || getRow r ^. lineHasNewline)
 
   renCells _ [] = ""
   renCells p ((ch, a):rest) = sgr p a <> T.singleton ch <> renCells a rest
 
   sgr p c | p == c = "" | otherwise = "\ESC[" <> T.intercalate ";" (filter (not . T.null) codes) <> "m" where
     codes = [intC, italC, ulC, invC, strikeC, fgC, bgC]
-    tog l yes no = if c^.l /= p^.l then if c^.l then yes else no else ""
+    tog l yes no = bool "" (bool no yes (c^.l)) (c^.l /= p^.l)
     intC = case (c^.attrsIntensity, p^.attrsIntensity) of (0,x)|x/=0->"22"; (1,_)->"1"; (2,_)->"2"; _->""
     italC = tog attrsItalic "3" "23"
     ulC = case (c^.attrsUnderline, p^.attrsUnderline) of (0,x)|x/=0->"24"; (1,_)->"4"; (2,_)->"21"; _->""
     invC = tog attrsInverse "7" "27"
     strikeC = tog attrsStrike "9" "29"
-    eff x = if x^.attrsInverse then (x^.attrsBg, x^.attrsFg) else (x^.attrsFg, x^.attrsBg)
+    eff x = bool id swap (x^.attrsInverse) (x^.attrsFg, x^.attrsBg)
     (fg, bg) = eff c; (pfg, pbg) = eff p
-    fgC = if fg == pfg then "" else "38;5;" <> showT fg
-    bgC = if bg == pbg then "" else "48;5;" <> showT bg
+    fgC = bool ("38;5;" <> showT fg) "" (fg == pfg)
+    bgC = bool ("48;5;" <> showT bg) "" (bg == pbg)
 
 data DECMode = DECOM | DECAWM | DECTCEM | AltScreen | AltScreenSaveCursor deriving (Show, Eq, Ord)
 
@@ -171,7 +164,7 @@ data EDMode = EDBelow | EDAbove | EDAll | EDSaved deriving (Show, Eq, Ord, Enum,
 data SGR = SReset | SBold | SFaint | SItal | SNoItal | SUL | SDUL | SInv | SNoInv
   | SStrike | SNoStrike | SNorm | SNoUL | SFg !Word8 | SBg !Word8 deriving (Show, Eq)
 
-parseAtom = (AChar <$> satisfy (not . isCtrl)) <|> parseCtrl
+parseAtom = AChar <$> satisfy (not . isCtrl) <|> parseCtrl
 
 parseCtrl = anyChar >>= \case
   '\ESC' -> parseEsc
@@ -189,12 +182,12 @@ parseCsi = do
   c <- anyChar
   pure $ maybe (AUnk $ "\ESC[" <> s <> T.singleton c) (AEsc . ECSI) $ do
     (priv, args, m) <- either (const Nothing) Just $ parseOnly csiP (s <> T.singleton c)
-    (if priv then privCsi else stdCsi) m args
+    bool stdCsi privCsi priv m args
   where
     csiP = do
       priv <- option False (True <$ char '?')
       c <- peekChar'
-      args <- if isDigit c || c == ';' then sepBy (option 0 decimal) (char ';') else pure []
+      args <- bool (pure []) (sepBy (option 0 decimal) (char ';')) (isDigit c || c == ';')
       m <- anyChar
       pure (priv, fromMaybe (0:|[]) $ NE.nonEmpty args, m)
 
@@ -259,11 +252,7 @@ isCtrl c = fromEnum c <= 0x1F || c == '\DEL'
 processAtoms :: Term -> [Atom] -> Term
 processAtoms = foldl' (flip processAtom)
 
-processAtom = \case
-  AChar c -> procChar c
-  ASCF f -> procSCF f
-  AEsc e -> procEsc e
-  AUnk _ -> id
+processAtom = \case AChar c -> procChar c; ASCF f -> procSCF f; AEsc e -> procEsc e; AUnk _ -> id
 
 procSCF = \case
   Bell -> id; BS -> moveCol (subtract 1); CR -> cursorCol .~ 0; LF -> procLF
@@ -301,9 +290,8 @@ procDEC on = \case
   DECOM -> (cursorState.origin .~ on) >>> curAbsTo (0,0)
   DECAWM -> modeWrap .~ on
   DECTCEM -> cursorVisible .~ on
-  AltScreen | on -> (altScreenActive .~ True) >>> clearAlt | otherwise -> altScreenActive .~ False
-  AltScreenSaveCursor | on -> saveCur >>> (altScreenActive .~ True) >>> clearAlt
-                      | otherwise -> (altScreenActive .~ False) >>> restoreCur
+  AltScreen -> bool (altScreenActive .~ False) ((altScreenActive .~ True) >>> clearAlt) on
+  AltScreenSaveCursor -> bool ((altScreenActive .~ False) >>> restoreCur) (saveCur >>> (altScreenActive .~ True) >>> clearAlt) on
   where clearAlt t = t & termAlt .~ linesRep (t^.numRows) (blankLine (t^.numCols))
 
 applySGR = \case
@@ -314,15 +302,15 @@ applySGR = \case
   SStrike -> attrsStrike .~ True; SNoStrike -> attrsStrike .~ False
   SNorm -> attrsIntensity .~ 0; SFg c -> attrsFg .~ c; SBg c -> attrsBg .~ c
 
-curAbsTo (r, c) t = curTo (r + if t^.cursorState.origin then t^.scrollTop else 0, c) t
+curAbsTo (r, c) t = curTo (r + bool 0 (t^.scrollTop) (t^.cursorState.origin), c) t
 
 curTo (r, c) t = t & cursorRow .~ clamp minY maxY r & cursorCol .~ clamp 0 (t^.numCols-1) c
   & cursorState.wrapNext .~ False
-  where (minY, maxY) = if t^.cursorState.origin then (t^.scrollTop, t^.scrollBottom) else (0, t^.numRows-1)
+  where (minY, maxY) = bool (0, t^.numRows-1) (t^.scrollTop, t^.scrollBottom) (t^.cursorState.origin)
 
 procLF = (cursorLine.lineHasNewline .~ True) >>> addNL True
 
-revIdx t = if t^.cursorRow == t^.scrollTop then scrollDown (t^.scrollTop) 1 t else moveRow (subtract 1) t
+revIdx t = bool (moveRow (subtract 1)) (scrollDown (t^.scrollTop) 1) (t^.cursorRow == t^.scrollTop) t
 
 eraseEL p t = clearRgn (r, c1) (r, c2) t where
   (r, c) = (t^.cursorRow, t^.cursorCol)
@@ -340,13 +328,13 @@ insChars n t = t & cursorLineCells %~ \cs -> V.take col cs <> V.replicate n' (' 
   <> V.slice col (t^.numCols - col - n') cs
   where col = t^.cursorCol; n' = clamp 0 (t^.numCols - col) n
 
-insLines n t | between (t^.scrollTop, t^.scrollBottom) (t^.cursorRow) = scrollDown (t^.cursorRow) n t | otherwise = t
+insLines n t = bool t (scrollDown (t^.cursorRow) n t) $ between (t^.scrollTop, t^.scrollBottom) (t^.cursorRow)
 
 delChars n t = t & cursorLineCells %~ \cs -> V.take col cs <> V.slice (col+n') (t^.numCols - col - n') cs
   <> V.replicate n' (' ', t^.termAttrs)
   where col = t^.cursorCol; n' = clamp 0 (t^.numCols - col) n
 
-delLines n t | between (t^.scrollTop, t^.scrollBottom) (t^.cursorRow) = scrollUp (t^.cursorRow) n t | otherwise = t
+delLines n t = bool t (scrollUp (t^.cursorRow) n t) $ between (t^.scrollTop, t^.scrollBottom) (t^.cursorRow)
 
 setSTBM mbT mbB t = t & scrollTop .~ top & scrollBottom .~ bot where
   t' = maybe 0 (subtract 1) mbT; b' = maybe (t^.numRows - 1) (subtract 1) mbB
@@ -361,22 +349,21 @@ scrollDown orig n t = t & activeScreen %~ upd where
 scrollUp orig n t = (copySB >>> activeScreen %~ upd) t where
   n' = clamp 0 (t^.scrollBottom - orig + 1) n
   blank = blankLineWith (t^.numCols) (t^.termAttrs)
-  copySB = if not (t^.altScreenActive) && orig == 0 then addScrollBack (linesTake n' (t^.termScreen) <>) else id
+  copySB = bool id (addScrollBack (linesTake n' (t^.termScreen) <>)) (not (t^.altScreenActive) && orig == 0)
   upd ls = linesTake orig ls <> linesTake (t^.scrollBottom - orig - n' + 1) (linesDrop (orig + n') ls)
     <> linesRep n' blank <> linesDrop (t^.scrollBottom + 1) ls
 
 procChar c = moveBefore >>> shift >>> setC >>> moveAfter where
-  moveBefore t | t^.modeWrap && t^.cursorState.wrapNext = addNL True t | otherwise = t
-  shift t | t^.insertMode && t^.cursorCol < t^.numCols - 1 =
-      t & cursorLineCells %~ \cs -> V.take (t^.numCols) (V.take (t^.cursorCol) cs <> V.singleton (' ', blankAttrs) <> V.drop (t^.cursorCol) cs)
-    | otherwise = t
+  moveBefore t = bool t (addNL True t) (t^.modeWrap && t^.cursorState.wrapNext)
+  shift t = bool t (t & cursorLineCells %~ \cs -> V.take (t^.numCols) (V.take (t^.cursorCol) cs <> V.singleton (' ', blankAttrs) <> V.drop (t^.cursorCol) cs))
+    (t^.insertMode && t^.cursorCol < t^.numCols - 1)
   setC t = t & cursorLineCells . vAt (t^.cursorCol) .~ (c, t^.termAttrs)
-  moveAfter t | t^.cursorCol < t^.numCols - 1 = moveCol (+1) t | otherwise = t & cursorState.wrapNext .~ True
+  moveAfter t = bool (t & cursorState.wrapNext .~ True) (moveCol (+1) t) (t^.cursorCol < t^.numCols - 1)
 
 addNL firstCol = doScr >>> moveCur where
-  doScr t = if t^.cursorRow == t^.scrollBottom then scrollUp (t^.scrollTop) 1 t else t
-  moveCur t = curTo (if t^.cursorRow == t^.scrollBottom then t^.cursorRow else t^.cursorRow + 1
-                    , if firstCol then 0 else t^.cursorCol) t
+  doScr t = bool t (scrollUp (t^.scrollTop) 1 t) (t^.cursorRow == t^.scrollBottom)
+  moveCur t = curTo (bool (t^.cursorRow + 1) (t^.cursorRow) (t^.cursorRow == t^.scrollBottom)
+                    , bool (t^.cursorCol) 0 firstCol) t
 
 clearRgn (r1, c1) (r2, c2) t = foldl' (\t' r -> clearRow r c1' c2' t') t [r1'..r2'] where
   r1' = clamp 0 (t^.numRows-1) (min r1 r2); r2' = clamp 0 (t^.numRows-1) (max r1 r2)
@@ -388,7 +375,6 @@ clearRow row c1 c2 t = t & activeScreen . linesAt row . lineCells %~
 clamp lo hi = max lo . min hi
 between (lo, hi) = (&&) <$> (lo <=) <*> (<= hi)
 
-showT :: Show a => a -> Text
 showT = T.pack . show
 
 data Terminal = Terminal
@@ -429,7 +415,7 @@ runParser t = case parse parseAtom t of
   Partial k -> case k "" of Done r a -> first (a:) $ runParser r; _ -> ([], t)
   Fail{} -> ([], t)
 
-readViewport tv = renderViewport <$> (readTVarIO tv >>= readTVarIO . _tTerm)
+readViewport = (renderViewport <$>) . readTVarIO . _tTerm <=< readTVarIO
 
 sendKeys tv input = readTVarIO tv >>= \term ->
   atomically (stateTVar (_tTerm term) (processInputEsc $ decodeEscapes input)) >>=
@@ -471,7 +457,7 @@ handle env "tools/call" (Just p) = call env (fromMaybe "" $ param @Text "name" p
 handle _ m _ = pure ["error" .= object ["code" .= (-32601 :: Int), "message" .= ("unknown: " <> m)]]
 
 call env "read" _ = ok <$> readViewport env
-call env "write" a = sendKeys env (fromMaybe "" $ param @Text "emit" a) >> (ok <$> readViewport env)
+call env "write" a = sendKeys env (fromMaybe "" $ param @Text "emit" a) >> pure (ok ("" :: Text))
 call _ n _ = pure ["error" .= object ["code" .= (-32602 :: Int), "message" .= ("unknown tool: " <> n)]]
 
 mcpLoop env = forever $ BL.fromStrict <$> BC.hGetLine stdin >>= dispatch . eitherDecode where

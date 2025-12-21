@@ -13,4 +13,4 @@ jobs:
       - name: Play
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#nethack -- -m anthropic/claude-sonnet-4-20250514 "NetHack is open via specter. Play until the game ends when your character dies or ascends. Do not save or quit the game. You may briefly narrate while you play for your own benefit. Do not ask for user input. You should preserve this notice on compaction."
+        run: nix run .#nethack -- -m anthropic/claude-opus-4-5 "Have fun playing NetHack! Push the envelope - see how far you can go. This is an autonomous session. Keep using specter to play. Yielding would inadvertently end the session."
