@@ -24,7 +24,7 @@
                 text) jq -rj '.part.text' <<< "$line"; nl=1 ;;
                 tool_use)
                   [[ $nl ]] && echo; nl=
-                  jq -r '"\u001b[38;5;205m\(.part.tool)\(if .part.state.input == {} then "" else ": \(.part.state.input)" end)\u001b[0m\(.part.state.output // "" | if startswith("\n") or . == "" then . else "\n\(.)" end)"' <<< "$line"
+                  jq -r '"\u001b[38;5;205m\(.part.tool)\(if .part.state.input == {} then "" else ": \(.part.state.input)" end)\u001b[0m\(.part.state.output // "" | if startswith("\n") or . == "" then . else "\n\(.)" end)\n"' <<< "$line"
                   ;;
               esac
             done

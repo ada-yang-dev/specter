@@ -20,7 +20,6 @@ executable specter
     , containers
     , lens
     , posix-pty
-    , process
     , stm
     , text
     , vector
