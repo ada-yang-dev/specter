@@ -15,18 +15,17 @@
           (pkgs.haskellPackages.callCabal2nix "specter" ./. {}) (_: { license = pkgs.lib.licenses.cc-by-nc-sa-40; });
         opencode = pkgs.writeShellApplication {
           name = "opencode";
-          runtimeInputs = [ pkgs.opencode pkgs.jq ];
           text = ''
-            nl=
-            ${pkgs.opencode}/bin/opencode run --format json "$@" | while IFS= read -r line; do
-              case $(jq -r '.type' <<< "$line") in
-                text) jq -rj '.part.text' <<< "$line"; nl=1 ;;
-                tool_use)
-                  [[ $nl ]] && echo; nl=
-                  jq -rj '"\u001b[38;5;205m\(.part.tool)\(if .part.state.input == {} then "" else ": \(.part.state.input)" end)\u001b[0m\(.part.state.output // "" | if startswith("\n") or . == "" then . else "\n\(.)" end)"' <<< "$line"; echo
-                  ;;
-              esac
-            done
+            ${pkgs.opencode}/bin/opencode run --format json "$@" | ${pkgs.jq}/bin/jq -n --unbuffered -rj '
+              def pink: "\u001b[38;5;205m"; def rst: "\u001b[0m";
+              def tool: pink + .part.tool + ((.part.state.input | if . == {} then "" else ": \(.)" end)) + rst +
+                        ((.part.state.output // "") | if . == "" or startswith("\n") then . else "\n\(.)" end) + "\n";
+              foreach inputs as $x ({nl:false};
+                if $x.type == "text" then {nl:true, out:$x.part.text}
+                elif $x.type == "tool_use" then {nl:false, out:((if .nl then "\n" else "" end) + ($x|tool))}
+                else . end;
+                .out // empty)
+            '
           '';
         };
         mkSpecter = name: packages: let
