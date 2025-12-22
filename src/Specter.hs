@@ -28,7 +28,7 @@ import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Tuple (swap)
+
 import Data.Vector qualified as V
 import Data.Word (Word8)
 import Prelude hiding (takeWhile)
