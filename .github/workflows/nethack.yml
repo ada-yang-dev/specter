@@ -8,9 +8,9 @@ jobs:
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v24
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
       - name: Play
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix run .#nethack -- -m anthropic/claude-opus-4-5 "Have fun playing NetHack! Push the envelope - see how far you can go. This is an autonomous session; it is critical that you do not ask for user feedback, as doing so would terminate the session inadvertently. Report back only after your character has died or ascended. Keep calling specter to maintain the session without human intervention. Tip - gas spores should be avoided or handled with extreme caution (ideally by a pet or from maximum distance)."
+        run: nix run .#nethack -- -m anthropic/claude-opus-4-5 $'Have fun playing NetHack via specter! This is an autonomous session; it is critical that you do not ask for user feedback, as doing so would terminate the session inadvertently. Report back only after your character has died or ascended.\n\nTip - Use ; to identify any unfamiliar symbol before engaging.'
