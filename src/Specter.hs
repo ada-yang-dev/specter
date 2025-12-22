@@ -138,10 +138,8 @@ renderViewport t = T.concat [renLine r | r <- [0..rows-1]] <> "\ESC[0m" where
     ulC = case (c^.attrsUnderline, p^.attrsUnderline) of (0,x)|x/=0->"24"; (1,_)->"4"; (2,_)->"21"; _->""
     invC = tog attrsInverse "7" "27"
     strikeC = tog attrsStrike "9" "29"
-    eff x = bool id swap (x^.attrsInverse) (x^.attrsFg, x^.attrsBg)
-    (fg, bg) = eff c; (pfg, pbg) = eff p
-    fgC = bool ("38;5;" <> showT fg) "" (fg == pfg)
-    bgC = bool ("48;5;" <> showT bg) "" (bg == pbg)
+    fgC = bool ("38;5;" <> showT (c^.attrsFg)) "" (c^.attrsFg == p^.attrsFg)
+    bgC = bool ("48;5;" <> showT (c^.attrsBg)) "" (c^.attrsBg == p^.attrsBg)
 
 data DECMode = DECOM | DECAWM | DECTCEM | AltScreen | AltScreenSaveCursor deriving (Show, Eq, Ord)
 
